@@ -1,6 +1,7 @@
 import base64
 from concurrent.futures import ThreadPoolExecutor
 import io
+import json
 import math
 import os
 import random
@@ -31,6 +32,7 @@ from app.services import (
     task_artifacts,
     video,
     volcengine_seedance,
+    wan3,
 )
 from app.utils import logging_utils, utils
 
@@ -2161,7 +2163,7 @@ def _select_materials_until_duration(
 def download_videos(
     task_id: str,
     search_terms: List[str],
-    source: str = "pexels",
+    source: str = "wan3",
     video_aspect: VideoAspect = VideoAspect.portrait,
     video_concat_mode: VideoConcatMode = VideoConcatMode.random,
     audio_duration: float = 0.0,
@@ -2169,6 +2171,7 @@ def download_videos(
     match_script_order: bool = False,
     progress_callback: Callable[[float], None] | None = None,
     image_motion: ImageMotion = ImageMotion.zoom,
+    on_task_created: Callable[[str], None] | None = None,
 ) -> List[str]:
     """
     搜索并下载覆盖配音时长所需的素材，返回本地文件路径。
@@ -2177,6 +2180,7 @@ def download_videos(
     文件就以 0~1 的完成比例调用一次，供任务层推进进度条。按需生成的付费
     素材源不报告下载进度。
     """
+    source = source or "wan3"
     provider = "pexels"
     remote_search_videos = search_videos_pexels
     if source == "pixabay":
@@ -2205,6 +2209,17 @@ def download_videos(
     elif material_directory and not os.path.isdir(material_directory):
         material_directory = ""
 
+    if source == "wan3":
+        return _download_videos_wan3_on_demand(
+            task_id=task_id,
+            search_terms=search_terms,
+            video_aspect=video_aspect,
+            audio_duration=audio_duration,
+            max_clip_duration=max_clip_duration,
+            material_directory=material_directory,
+            on_task_created=on_task_created,
+            progress_callback=progress_callback,
+        )
     if source == "wavespeed":
         # AI 生成按条计费，不能沿用库存源"先为全部关键词取回候选、再挑选"
         # 的流程，否则会为用不到的片段付费。生成源改为逐段按需生成，凑够
@@ -2701,6 +2716,122 @@ def _download_videos_ofox_on_demand(
     return video_paths
 
 
+def _save_wan3_task_id(local_task_id: str, remote_task_id: str) -> None:
+    """Persist recovery IDs for standalone material calls without a task callback."""
+    target = Path(utils.task_dir(local_task_id)) / "wan3-tasks.json"
+    task_ids = []
+    if target.exists():
+        data = json.loads(target.read_text(encoding="utf-8"))
+        task_ids = data["task_ids"]
+        if not isinstance(task_ids, list):
+            raise ValueError("Wan3 recovery record task_ids must be a list")
+    task_ids = [*task_ids, remote_task_id]
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=target.parent,
+            prefix=".wan3-tasks-", suffix=".tmp", delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            json.dump({"local_task_id": local_task_id, "provider": "wan3", "task_ids": task_ids}, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, target)
+        temp_path = None
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+
+def _download_videos_wan3_on_demand(
+    *,
+    task_id: str,
+    search_terms: List[str],
+    video_aspect: VideoAspect,
+    audio_duration: float,
+    max_clip_duration: int,
+    material_directory: str,
+    on_task_created: Callable[[str], None] | None = None,
+    progress_callback: Callable[[float], None] | None = None,
+) -> List[str]:
+    """Generate each ordered visual prompt once, then verify actual coverage."""
+    try:
+        required_duration = float(audio_duration)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise wan3.Wan3Error("Wan3 audio duration must be a finite number") from exc
+    if not math.isfinite(required_duration):
+        raise wan3.Wan3Error("Wan3 audio duration must be a finite number")
+    if required_duration <= 0:
+        return []
+    if isinstance(max_clip_duration, bool) or not isinstance(max_clip_duration, int) or not 2 <= max_clip_duration <= 30:
+        raise wan3.Wan3Error("Wan3 clip duration must be an integer from 2 to 30 seconds")
+    if not search_terms or any(not isinstance(term, str) or not term.strip() for term in search_terms):
+        raise wan3.Wan3Error("Wan3 requires nonempty ordered visual prompts")
+    if len(search_terms) * max_clip_duration + 0.001 < required_duration:
+        raise wan3.Wan3Error(
+            "Wan3 visual prompts cannot cover the narration at the configured clip duration: "
+            f"prompts={len(search_terms)}, clip={max_clip_duration}s, required={required_duration:.2f}s"
+        )
+
+    def record_task(remote_task_id: str) -> None:
+        if on_task_created is not None:
+            on_task_created(remote_task_id)
+        else:
+            _save_wan3_task_id(task_id, remote_task_id)
+
+    paths: List[str] = []
+    sources: list[dict[str, Any]] = []
+    total_duration = 0.0
+    try:
+        for term in search_terms:
+            items = wan3.generate_videos(
+                search_term=term,
+                minimum_duration=max_clip_duration,
+                video_aspect=video_aspect,
+                on_task_created=record_task,
+            )
+            if not items:
+                raise wan3.Wan3Error("Wan3 returned no material for a visual prompt")
+            for item in items:
+                info = item.source_info if isinstance(item.source_info, dict) else {}
+                remote_task_id = str(info.get("asset_id") or "")
+                saved_path = _save_generated_video_with_retry(item.url, material_directory, "wan3")
+                if not saved_path:
+                    raise wan3.Wan3DownloadError(
+                        f"Wan3 generated a paid video but download failed: id={remote_task_id or 'unknown'}",
+                        task_id=remote_task_id,
+                    )
+                try:
+                    duration = _get_downloaded_video_duration(saved_path)
+                except Exception as exc:
+                    raise wan3.Wan3DownloadError(
+                        f"Wan3 paid output duration could not be measured: id={remote_task_id or 'unknown'}",
+                        task_id=remote_task_id,
+                    ) from exc
+                paths.append(saved_path)
+                record = _material_source_record(item, saved_path)
+                record["duration"] = duration
+                sources.append(record)
+                total_duration += min(max_clip_duration, duration)
+                if progress_callback is not None:
+                    try:
+                        progress_callback(min(total_duration / required_duration, 1.0))
+                    except Exception as exc:
+                        logger.warning(f"Wan3 progress callback failed: error={type(exc).__name__}")
+                _persist_material_sources(task_id, sources)
+        if total_duration + 0.001 < required_duration:
+            raise wan3.Wan3Error(
+                "Wan3 ordered materials do not cover the narration after actual-duration validation: "
+                f"available={total_duration:.2f}s, required={required_duration:.2f}s; "
+                "no additional paid task was submitted"
+            )
+    except Exception:
+        _persist_material_sources(task_id, sources)
+        raise
+    logger.success(f"generated and downloaded {len(paths)} ordered Wan3 videos")
+    return paths
+
+
 def _download_videos_muapi_on_demand(
     *,
     task_id: str,
@@ -3063,9 +3194,3 @@ def _download_videos_by_script_order(
     logger.success(f"downloaded {len(video_paths)} ordered videos")
     _persist_material_sources(task_id, material_sources)
     return video_paths
-
-
-if __name__ == "__main__":
-    download_videos(
-        "test123", ["Money Exchange Medium"], audio_duration=100, source="pixabay"
-    )

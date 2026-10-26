@@ -1131,6 +1131,41 @@ Please note that you must use English for generating video search terms; Chinese
     return search_terms
 
 
+def generate_video_prompts(
+    video_subject: str,
+    video_script: str,
+    amount: int = 5,
+    match_script_order: bool = True,
+    app_config=None,
+) -> List[str]:
+    """Generate ordered scene descriptions for text-to-video generation."""
+    prompt = f"""Create exactly {amount} complete visual scene descriptions for a video.
+Follow the narration chronologically. Describe the subject, action, setting,
+framing, camera movement and consistent visual style for each scene.
+Use the narration's language. These are text-to-video prompts, not stock search
+keywords. Return only a JSON array of nonempty strings, one prompt per scene.
+Do not include narration, dialogue, music instructions or Markdown.
+Subject: {video_subject}
+Narration: {utils.remove_pause_tags(video_script or '')}"""
+    for _ in range(_max_retries):
+        response = (_generate_response(prompt) if app_config is None else
+                    _generate_response(prompt, app_config=app_config))
+        if response.startswith("Error: "):
+            return []
+        try:
+            result = json.loads(_strip_code_fence(response))
+        except (ValueError, TypeError):
+            try:
+                result = _extract_embedded_json(response, "[")
+            except ValueError:
+                continue
+        if (isinstance(result, list) and len(result) == amount
+                and all(isinstance(item, str) and item.strip() for item in result)):
+            return [item.strip() for item in result]
+    logger.error("failed to generate the requested complete scene prompts")
+    return []
+
+
 # =============================================================================
 # Social publishing metadata
 #

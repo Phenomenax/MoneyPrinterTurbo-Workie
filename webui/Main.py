@@ -58,6 +58,7 @@ from app.services import (
     subtitle,
     video,
     volcengine_seedance,
+    wan3,
     voice,
     webui_task,
 )
@@ -134,6 +135,7 @@ LOOMLOOM_MAX_POLL_FAILURES = 5
 VIDEO_SOURCE_GROUPS = {
     "stock_video": ("pexels", "pixabay", "coverr"),
     "ai_video": (
+        "wan3",
         "metaso_minimax",
         "ofox",
         "loomloom",
@@ -1559,7 +1561,7 @@ def _apply_restored_params(params):
     )
 
     # 视频设置。素材上传控件不能由服务端写入，因此本地素材需要用户重新选择。
-    video_source = params.get("video_source") or "pexels"
+    video_source = params.get("video_source") or "wan3"
     _set_stable_widget_value("video_source_select", video_source)
     _set_stable_widget_value(
         "video_concat_mode_select", params.get("video_concat_mode") or "random"
@@ -3713,6 +3715,29 @@ def _render_settings_dialog():
                 st.markdown(f"#### {tr('AI Video Generation APIs')}")
                 st.caption(tr("AI Video Generation APIs Help"))
 
+                st.markdown("**Wan3 (Alibaba Cloud)**")
+                wan3_api_key = st.text_input(
+                    "Wan3 API Key",
+                    value=str(config.app.get("wan3_api_key", "") or ""),
+                    type="password",
+                    key="wan3_api_key_input",
+                )
+                _set_runtime_config("app", "wan3_api_key", wan3_api_key.strip())
+                wan3_base_url = st.text_input(
+                    "Wan3 Base URL",
+                    value=str(config.app.get("wan3_base_url", "") or ""),
+                    placeholder="https://<WorkspaceId>.cn-beijing.maas.aliyuncs.com",
+                    key="wan3_base_url_input",
+                )
+                _set_runtime_config("app", "wan3_base_url", wan3_base_url.strip())
+                wan3_model = st.text_input(
+                    "Wan3 Model",
+                    value=str(config.app.get("wan3_model_name", "wan3.0-video") or "wan3.0-video"),
+                    key="wan3_model_name_input",
+                )
+                _set_runtime_config("app", "wan3_model_name", wan3_model.strip())
+                st.divider()
+
                 # 视频生成 Provider 按赞助商优先展示，赞助商内部顺序
                 # 与 VIDEO_SOURCE_GROUPS 一致：秘塔、OFox、胜算云、火山引擎。
                 st.markdown(f"**{tr('Metaso MiniMax H3')}**")
@@ -5229,6 +5254,7 @@ def _render_video_settings(panel, params):
                 (tr("Random"), "random"),
             ]
             video_source_labels = {
+                "wan3": "Wan3 (Alibaba Cloud)",
                 "pexels": tr("Pexels"),
                 "pixabay": tr("Pixabay"),
                 "coverr": tr("Coverr"),
@@ -5242,8 +5268,10 @@ def _render_video_settings(panel, params):
                 "local": tr("Local file"),
             }
             saved_video_source_name = str(
-                config.app.get("video_source", "pexels") or "pexels"
+                config.app.get("video_source", "wan3") or "wan3"
             )
+            if saved_video_source_name not in video_source_labels:
+                saved_video_source_name = "wan3"
             params.video_source = grouped_selectbox(
                 tr("Video Source"),
                 groups=(
@@ -5268,6 +5296,8 @@ def _render_video_settings(panel, params):
                     _effective_loomloom_api_token()
                 )
 
+            if params.video_source == "wan3":
+                st.caption("Wan3 · Alibaba Cloud Model Studio")
             if params.video_source == "wavespeed":
                 st.caption(tr("WaveSpeed AI Video Help"))
             if params.video_source == "volcengine_seedance":
@@ -5445,7 +5475,9 @@ def _render_video_settings(panel, params):
 
             # MiniMax H3 的远端时长范围是 4～15 秒。选择秘塔时使用完整能力
             # 范围，既避免 2/3 秒被按 4 秒计费，也让 WebUI 与 CLI、服务层一致。
-            if params.video_source == "metaso_minimax":
+            if params.video_source == "wan3":
+                video_clip_durations = list(range(2, 31))
+            elif params.video_source == "metaso_minimax":
                 video_clip_durations = list(
                     range(
                         metaso_minimax.DEFAULT_MIN_DURATION_SECONDS,
@@ -5468,7 +5500,7 @@ def _render_video_settings(panel, params):
                     "video_clip_duration",
                     video_clip_durations,
                     5
-                    if params.video_source in {"metaso_minimax", "muapi"}
+                    if params.video_source in {"wan3", "metaso_minimax", "muapi"}
                     else 3,
                 ),
                 key="video_clip_duration_select",
@@ -8088,6 +8120,7 @@ def _render_generation_controls(
             voxcpm_prompt_text = _get_voxcpm_prompt_text()
 
         if params.video_source not in [
+            "wan3",
             "pexels",
             "pixabay",
             "coverr",
@@ -8103,6 +8136,14 @@ def _render_generation_controls(
             _remove_active_generation_task(task_id)
             st.error(tr("Please Select a Valid Video Source"))
             st.stop()
+
+        if params.video_source == "wan3":
+            try:
+                wan3.validate_config(config.snapshot_config_with_pending(config.app))
+            except wan3.Wan3Error as exc:
+                _remove_active_generation_task(task_id)
+                st.error(str(exc))
+                st.stop()
 
         if params.video_source == "pexels" and not config.app.get(
             "pexels_api_keys", ""
