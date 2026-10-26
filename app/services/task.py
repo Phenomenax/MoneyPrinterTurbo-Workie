@@ -32,6 +32,7 @@ from app.services import (
     video,
     volcengine_seedance,
     voice,
+    wan3,
 )
 from app.services import upload_post
 from app.services import state as sm
@@ -97,7 +98,7 @@ _VIDEO_MUSIC_PROVIDERS = {
 _SUPPORTED_VIDEO_SOURCES = frozenset({
     "pexels", "pixabay", "coverr", "local", "wavespeed",
     "volcengine_seedance", "ofox", "metaso_minimax", "muapi",
-    "loomloom", "openai_image",
+    "loomloom", "openai_image", "wan3",
 })
 
 
@@ -376,17 +377,18 @@ def generate_script(task_id, params):
     return video_script
 
 
-def generate_terms(task_id, params, video_script):
+def generate_terms(task_id, params, video_script, *, amount=None):
     logger.info("\n\n## generating video terms")
     video_terms = params.video_terms
     if not video_terms:
         # 开启素材按文案顺序匹配后，关键词本身也必须按脚本叙事顺序生成；
         # 否则后续即使顺序下载和顺序拼接，也只能复用一组全局主题词，
         # 无法改善“后面内容的画面提前出现”的问题。
-        video_terms = llm.generate_terms(
+        generate = llm.generate_video_prompts if params.video_source == "wan3" else llm.generate_terms
+        video_terms = generate(
             video_subject=params.video_subject,
             video_script=utils.remove_pause_tags(video_script),
-            amount=8 if params.match_materials_to_script else 5,
+            amount=amount or (8 if params.match_materials_to_script else 5),
             match_script_order=params.match_materials_to_script,
         )
     else:
@@ -412,7 +414,7 @@ def generate_terms(task_id, params, video_script):
 
     # 可选的 TwelveLabs Marengo 语义重排：未启用时返回原顺序，无任何副作用。
     # 顺序匹配模式下关键词顺序本身就是脚本叙事顺序，必须保持原样，故跳过。
-    if not params.match_materials_to_script:
+    if not params.match_materials_to_script and params.video_source != "wan3":
         video_terms = twelvelabs.rerank_terms_by_subject(
             video_subject=params.video_subject,
             search_terms=video_terms,
@@ -807,6 +809,28 @@ def get_video_materials(
         logger.info(f"\n\n## downloading videos from {params.video_source}")
         # 顺序匹配模式只在用户显式开启时生效。这里强制素材下载按关键词顺序
         # 轮询，避免某个早期关键词下载太多素材，把后续脚本主题挤出最终时间线。
+        wan3_task_ids = []
+        def record_wan3_task(remote_task_id):
+            if remote_task_id not in wan3_task_ids:
+                wan3_task_ids.append(remote_task_id)
+            reference_saved = False
+            try:
+                material._save_wan3_task_id(task_id, remote_task_id)
+                reference_saved = True
+            except Exception as exc:
+                logger.warning(f"could not save Wan3 task ledger: {type(exc).__name__}")
+            try:
+                reference = {"wan3_task_id": remote_task_id, "wan3_task_ids": list(wan3_task_ids)}
+                if not sm.state.patch_task(task_id, **reference):
+                    sm.state.update_task(task_id, **reference)
+            except Exception as exc:
+                logger.warning(f"could not update Wan3 task state: {type(exc).__name__}")
+            script_saved = task_artifacts.patch_script_data(
+                task_id, wan3_task_id=remote_task_id, wan3_task_ids=list(wan3_task_ids)
+            )
+            if not reference_saved and not script_saved:
+                raise RuntimeError("could not persist the Wan3 remote task reference")
+        wan3_options = {"on_task_created": record_wan3_task} if params.video_source == "wan3" else {}
         try:
             downloaded_videos = material.download_videos(
                 task_id=task_id,
@@ -818,14 +842,24 @@ def get_video_materials(
                     if params.match_materials_to_script
                     else params.video_concat_mode
                 ),
-                audio_duration=audio_duration * params.video_count,
+                audio_duration=audio_duration * params.video_count * (max(1, utils.normalize_clip_speed(params.video_clip_speed)) if params.video_source == "wan3" else 1),
                 max_clip_duration=params.video_clip_duration,
                 match_script_order=params.match_materials_to_script,
                 image_motion=params.image_motion,
                 # 素材阶段占用 40%~50%：每下完一个文件推进一次，慢速网络下
                 # 进度条不再长时间停在 40%。
                 progress_callback=_stage_progress_reporter(task_id, 40, 50),
+                **wan3_options,
             )
+        except wan3.Wan3Error as exc:
+            remote_task_id = str(getattr(exc, "task_id", "") or "").strip()
+            if remote_task_id and remote_task_id not in wan3_task_ids:
+                wan3_task_ids.append(remote_task_id)
+            details = {"wan3_task_ids": list(wan3_task_ids)}
+            if remote_task_id:
+                details["wan3_task_id"] = remote_task_id
+            _mark_task_failed(task_id, "materials", str(exc), details=details)
+            return None
         except volcengine_seedance.VolcEngineSeedanceError as exc:
             # 未确认状态和已生成但下载失败都对应一个可在方舟控制台恢复的远端
             # 任务。统一从异常携带的 task_id 写入失败状态，避免不同异常分支
@@ -1009,13 +1043,19 @@ def generate_final_videos(
         and bgm_service.should_use_bgm(params.bgm_type, params.bgm_volume)
     )
     # Matching preserves keyword order; batch allocation varies each keyword's candidates.
-    if params.match_materials_to_script:
+    if params.match_materials_to_script or params.video_source == "wan3":
         video_concat_mode = VideoConcatMode.sequential
     elif params.video_count == 1:
         video_concat_mode = params.video_concat_mode
     else:
         video_concat_mode = VideoConcatMode.random
     video_transition_mode = params.video_transition_mode
+    max_clip_duration = params.video_clip_duration
+    if params.video_source == "wan3" and downloaded_videos:
+        # combine_videos interprets this cap as playback seconds and handles
+        # speed internally. Spread scenes across the narration so later shots
+        # are not discarded when the supplied storyboard has many short beats.
+        max_clip_duration = min(max_clip_duration, audio_duration / len(downloaded_videos))
 
     _progress = 50
     for i in range(params.video_count):
@@ -1046,7 +1086,7 @@ def generate_final_videos(
             video_fit_mode=params.video_fit_mode,
             video_concat_mode=video_concat_mode,
             video_transition_mode=video_transition_mode,
-            max_clip_duration=params.video_clip_duration,
+            max_clip_duration=max_clip_duration,
             threads=params.n_threads,
             clip_speed=params.video_clip_speed,
             progress_callback=_stage_progress_reporter(
@@ -1545,6 +1585,14 @@ def _run_pipeline(
             task_id, "preflight", f"unsupported video source: {params.video_source!r}"
         )
 
+    if stop_at in {"materials", "video"} and params.video_source == "wan3":
+        try:
+            if not 2 <= params.video_clip_duration <= 30:
+                raise wan3.Wan3Error("Wan3 clip duration must be an integer from 2 to 30 seconds")
+            wan3.validate_config()
+        except wan3.Wan3Error as exc:
+            return _mark_task_failed(task_id, "preflight", str(exc))
+
     if (
         stop_at in {"materials", "video"}
         and params.video_source == "volcengine_seedance"
@@ -1683,7 +1731,12 @@ def _run_pipeline(
 
     # 2. Generate terms
     video_terms = ""
-    if stop_at in {"terms", "materials", "video"} and params.video_source != "local":
+    # Automatic Wan3 scene count depends on narration length. Supplied storyboard
+    # prompts bypass this LLM step and keep their exact order.
+    defer_wan3_prompts = (params.video_source == "wan3" and not params.video_terms
+                         and stop_at in {"materials", "video"})
+    if (stop_at in {"terms", "materials", "video"} and params.video_source != "local"
+            and not defer_wan3_prompts):
         video_terms = generate_terms(task_id, params, video_script)
         if not video_terms:
             return _mark_task_failed(
@@ -1777,6 +1830,15 @@ def _run_pipeline(
         return {"subtitle_path": subtitle_path}
 
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=40)
+
+    if defer_wan3_prompts:
+        amount = max(1, math.ceil(audio_duration * params.video_count
+                                 * max(1, utils.normalize_clip_speed(params.video_clip_speed))
+                                 / params.video_clip_duration))
+        video_terms = generate_terms(task_id, params, video_script, amount=amount)
+        if not video_terms:
+            return _mark_task_failed(task_id, "terms", "failed to generate video scene prompts")
+        save_script_data(task_id, video_script, video_terms, params)
 
     # 5. Get video materials
     downloaded_videos = get_video_materials(

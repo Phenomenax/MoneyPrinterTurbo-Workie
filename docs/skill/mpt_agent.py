@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import os
 import re
@@ -24,10 +25,12 @@ PROJECT_ARCHIVE_URL = (
     "https://github.com/harry0703/MoneyPrinterTurbo/archive/refs/heads/main.zip"
 )
 DEFAULT_ROOT = Path.home() / "MoneyPrinterTurbo"
+DEFAULT_VIDEO_SOURCE = "wan3"
 DEFAULT_VOICE_NAME = "zh-CN-XiaoxiaoNeural-Female"
 DEFAULT_UV_LOCK_TIMEOUT = "1200"
 NEEDS_INPUT_EXIT_CODE = 10
 SUPPORTED_SOURCES = {
+    "wan3",
     "pexels",
     "pixabay",
     "coverr",
@@ -142,6 +145,12 @@ def ensure_project(root: Path) -> None:
         return
     if root.exists() and any(root.iterdir()):
         raise SkillError(f"installation directory exists but is not a valid project: {root}")
+    if "github.com/harry0703/MoneyPrinterTurbo/" in PROJECT_ARCHIVE_URL:
+        raise SkillError(
+            "Wan3-enabled MoneyPrinterTurbo is not installed. Use --root to select "
+            "the updated checkout (for local validation: F:/TFZY/MoneyPrinterTurbo). "
+            "The fork archive URL is pending; the original upstream archive is not installed automatically."
+        )
 
     root.parent.mkdir(parents=True, exist_ok=True)
     log(f"first-time installation: downloading the official project to {root}")
@@ -178,7 +187,39 @@ def ensure_config(root: Path) -> Path:
     if not config_path.exists():
         shutil.copy2(root / "config.example.toml", config_path)
         log(f"created configuration file: {config_path}")
+    text = config_path.read_text(encoding="utf-8")
+    original = text
+    for key, value in {
+        "wan3_api_key": "",
+        "wan3_base_url": "",
+        "wan3_model_name": "wan3.0-video",
+    }.items():
+        text = _insert_app_config_value(text, key, value)
+    if text != original:
+        config_path.write_text(text, encoding="utf-8")
     return config_path
+
+
+def _insert_app_config_value(text: str, key: str, value: object) -> str:
+    """Add missing app fields without touching user settings or other tables."""
+    try:
+        document = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        raise SkillError("configuration is not valid TOML") from exc
+    settings = document.get("app", document)
+    if not isinstance(settings, dict):
+        raise SkillError("configuration app settings must be a TOML table")
+    if key in settings:
+        return text
+    encoded = json.dumps(value, ensure_ascii=False)
+    app_header = re.search(r"(?m)^\[app\][ \t]*(?:#.*)?$", text)
+    if app_header:
+        end = text.find("\n", app_header.end())
+        if end < 0:
+            return text + f"\n{key} = {encoded}\n"
+        return text[: end + 1] + f"{key} = {encoded}\n" + text[end + 1 :]
+    # Older configurations without an explicit [app] use root-level fields.
+    return f"{key} = {encoded}\n" + text
 
 
 def _plain_config_value(text: str, key: str) -> str:
@@ -201,7 +242,11 @@ def _plain_config_value(text: str, key: str) -> str:
 def _replace_config_value(text: str, key: str, value: object) -> str:
     """Replace one active field while preserving the configuration layout."""
     pattern = re.compile(rf"(?m)^({re.escape(key)}\s*=\s*).*$")
-    match = pattern.search(text)
+    app_header = re.search(r"(?m)^\[app\][ \t]*(?:#.*)?$", text)
+    start = app_header.end() if app_header else 0
+    next_table = re.search(r"(?m)^\s*\[", text[start:])
+    end = start + next_table.start() if next_table else len(text)
+    match = pattern.search(text, start, end)
     if match is None:
         raise SkillError(f"configuration field not found in config.toml: {key}")
     value_start = match.start() + len(match.group(1))
@@ -252,12 +297,24 @@ def apply_environment_config(config_path: Path) -> None:
     base_url = os.environ.get("MPT_LLM_BASE_URL", "").strip()
     model_name = os.environ.get("MPT_LLM_MODEL_NAME", "").strip()
     pexels_key = os.environ.get("MPT_PEXELS_API_KEY", "").strip()
+    pixabay_key = (
+        os.environ.get("MPT_PIXABAY_API_KEY", "").strip()
+        or os.environ.get("PIXABAY_API_KEY", "").strip()
+    )
     seedance_key = os.environ.get("MPT_VOLCENGINE_ARK_API_KEY", "").strip()
     ofox_key = os.environ.get("MPT_OFOX_API_KEY", "").strip()
     metaso_minimax_key = os.environ.get(
         "MPT_METASO_MINIMAX_API_KEY", ""
     ).strip()
     muapi_key = os.environ.get("MPT_MUAPI_API_KEY", "").strip()
+    wan3_values = {
+        "wan3_api_key": (
+            os.environ.get("MPT_WAN3_API_KEY", "").strip()
+            or os.environ.get("DASHSCOPE_API_KEY", "").strip()
+        ),
+        "wan3_base_url": os.environ.get("MPT_WAN3_BASE_URL", "").strip(),
+        "wan3_model_name": os.environ.get("MPT_WAN3_MODEL_NAME", "").strip(),
+    }
     if not any(
         (
             provider,
@@ -265,10 +322,12 @@ def apply_environment_config(config_path: Path) -> None:
             base_url,
             model_name,
             pexels_key,
+            pixabay_key,
             seedance_key,
             ofox_key,
             metaso_minimax_key,
             muapi_key,
+            *wan3_values.values(),
         )
     ):
         return
@@ -292,6 +351,9 @@ def apply_environment_config(config_path: Path) -> None:
     if pexels_key:
         text = _replace_config_value(text, "pexels_api_keys", [pexels_key])
         changes.append("pexels_api_keys")
+    if pixabay_key:
+        text = _replace_config_value(text, "pixabay_api_keys", [pixabay_key])
+        changes.append("pixabay_api_keys")
     if seedance_key:
         text = _replace_config_value(
             text, "volcengine_seedance_api_key", seedance_key
@@ -308,6 +370,11 @@ def apply_environment_config(config_path: Path) -> None:
     if muapi_key:
         text = _replace_config_value(text, "muapi_api_key", muapi_key)
         changes.append("muapi_api_key")
+    for field, value in wan3_values.items():
+        if value:
+            text = _insert_app_config_value(text, field, value)
+            text = _replace_config_value(text, field, value)
+            changes.append(field)
     config_path.write_text(text, encoding="utf-8")
     log("updated configuration fields: " + ", ".join(changes))
 
@@ -363,7 +430,7 @@ def reuse_existing_llm_provider(config_path: Path) -> str:
 
 def selected_video_source(cli_args: list[str]) -> str:
     """Read the effective material source from forwarded CLI arguments."""
-    source = "pexels"
+    source = DEFAULT_VIDEO_SOURCE
     for index, item in enumerate(cli_args):
         if item == "--video-source" and index + 1 < len(cli_args):
             source = cli_args[index + 1].strip().lower()
@@ -377,22 +444,71 @@ def has_cli_option(cli_args: list[str], option: str) -> bool:
     return any(item == option or item.startswith(f"{option}=") for item in cli_args)
 
 
-def _last_cli_value(cli_args: list[str], option: str) -> str:
+def cli_option_value(cli_args: list[str], option: str) -> str:
     value = ""
     for index, item in enumerate(cli_args):
-        if item == option and index + 1 < len(cli_args):
+        if item == option:
+            if index + 1 >= len(cli_args) or cli_args[index + 1].startswith("--"):
+                raise SkillError(f"{option} requires a value")
             value = cli_args[index + 1]
         elif item.startswith(f"{option}="):
             value = item.split("=", 1)[1]
-    return value.strip()
+    return value
 
 
-def _requires_llm(cli_args: list[str]) -> bool:
-    # Match task.generate_script and the local-material terms bypass.
-    return not _last_cli_value(cli_args, "--video-script") or (
-        selected_video_source(cli_args) != "local"
-        and not _last_cli_value(cli_args, "--video-terms")
-    )
+def prepare_storyboard(cli_args: list[str]) -> list[str]:
+    """Resolve a forwarded file before the generation command changes directory."""
+    if not has_cli_option(cli_args, "--storyboard"):
+        return cli_args
+    value = cli_option_value(cli_args, "--storyboard")
+    path = Path(value).expanduser().resolve()
+    if not value.strip() or not path.is_file():
+        raise SkillError(f"storyboard file does not exist: {path}")
+    result = list(cli_args)
+    for index, item in enumerate(result):
+        if item == "--storyboard":
+            result[index + 1] = str(path)
+        elif item.startswith("--storyboard="):
+            result[index] = f"--storyboard={path}"
+    return result
+
+
+def needs_text_llm(cli_args: list[str]) -> bool:
+    if has_cli_option(cli_args, "--storyboard"):
+        return False
+    script = cli_option_value(cli_args, "--video-script").strip()
+    terms = cli_option_value(cli_args, "--video-terms").strip()
+    return not script or (selected_video_source(cli_args) != "local" and not terms)
+
+
+def verify_project_capabilities(root: Path, cli_args: list[str]) -> None:
+    """Inspect the CLI without importing app configuration or installing dependencies."""
+    if selected_video_source(cli_args) != "wan3" and not has_cli_option(cli_args, "--storyboard"):
+        return
+    try:
+        tree = ast.parse((root / "cli.py").read_text(encoding="utf-8-sig"))
+        sources = next(
+            ast.literal_eval(node.value)
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "_CLI_VIDEO_SOURCES" for target in node.targets)
+        )
+        options = {
+            item.value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "add_argument"
+            for item in node.args if isinstance(item, ast.Constant)
+        }
+        supported = "wan3" in sources and "--storyboard" in options
+    except (OSError, SyntaxError, ValueError, TypeError, StopIteration):
+        supported = False
+    if not supported:
+        raise SkillError(
+            f"MoneyPrinterTurbo at {root} does not support wan3 and --storyboard. "
+            "Upgrade that installation or use --root to select the updated checkout; "
+            "the existing installation was not overwritten."
+        )
 
 
 def missing_config(config_path: Path, cli_args: list[str]) -> tuple[str, list[str]]:
@@ -400,15 +516,15 @@ def missing_config(config_path: Path, cli_args: list[str]) -> tuple[str, list[st
     text = config_path.read_text(encoding="utf-8")
     provider = (_plain_config_value(text, "llm_provider") or "moonshot").lower()
     missing: list[str] = []
-    needs_llm = _requires_llm(cli_args)
-    if needs_llm and provider not in KEYLESS_LLM_PROVIDERS and not _has_configured_value(
+    require_llm = needs_text_llm(cli_args)
+    if require_llm and provider not in KEYLESS_LLM_PROVIDERS and not _has_configured_value(
         _plain_config_value(text, f"{provider}_api_key")
     ):
         missing.append(f"{provider}_api_key")
-    if needs_llm and provider == "kimi_code" and not _provider_is_ready(text, provider):
+    if require_llm and provider == "kimi_code" and not _provider_is_ready(text, provider):
         # 无 Key 可填，缺失的是 WebUI 登录动作而不是配置字段。
         missing.append("kimi_code_sign_in")
-    if needs_llm and provider == CUSTOM_OPENAI_PROVIDER:
+    if require_llm and provider == CUSTOM_OPENAI_PROVIDER:
         for suffix in ("base_url", "model_name"):
             field = f"{provider}_{suffix}"
             if not _has_configured_value(_plain_config_value(text, field)):
@@ -422,7 +538,11 @@ def missing_config(config_path: Path, cli_args: list[str]) -> tuple[str, list[st
             "Local video source requires --video-materials pointing to a "
             "directory of video files"
         )
-    if source == "volcengine_seedance":
+    if source == "wan3":
+        for field in ("wan3_api_key", "wan3_base_url"):
+            if not _has_configured_value(_plain_config_value(text, field)):
+                missing.append(field)
+    elif source == "volcengine_seedance":
         # 与运行时 Provider 保持完全一致的凭据优先级，避免 Skill 预检通过后
         # 主程序却读取了另一把 Key。ARK_API_KEY 语义过于宽泛，明确不再兼容。
         value = (
@@ -501,6 +621,7 @@ def report_missing_config(provider: str, missing: list[str]) -> int:
             "ofox_api_key",
             "metaso_minimax_api_key",
             "muapi_api_key",
+            "wan3_api_key",
         }
         for field in missing
     ):
@@ -526,6 +647,12 @@ def report_missing_config(provider: str, missing: list[str]) -> int:
     if "pexels_api_keys" in missing:
         print(f"PEXELS_API_KEY_URL={PEXELS_API_KEY_URL}")
         print(f"PEXELS_API_KEY_HELP_URL={PEXELS_API_KEY_HELP_URL}")
+    if "pixabay_api_keys" in missing:
+        print("PIXABAY_API_KEY_ENV=MPT_PIXABAY_API_KEY")
+    if any(field.startswith("wan3_") for field in missing):
+        print("WAN3_API_KEY_ENV=MPT_WAN3_API_KEY (or DASHSCOPE_API_KEY)")
+        print("WAN3_BASE_URL_ENV=MPT_WAN3_BASE_URL")
+        print("WAN3_API_HELP_URL=https://help.aliyun.com/zh/model-studio/wan3-video-generation-api-reference")
     if "kimi_code_sign_in" in missing:
         print(
             "KIMI_CODE_SIGN_IN_REQUIRED="
@@ -599,7 +726,7 @@ def _validate_pexels_key(api_key: str) -> str:
 
 def validate_pexels_config(config_path: Path, cli_args: list[str]) -> bool:
     """
-    Validate all Pexels keys used by the default material source.
+    Validate Pexels keys only when Pexels is explicitly selected.
 
     Downstream code selects configured keys randomly. Keeping rejected keys can
     cause intermittent 401 responses and missing material results. If at least
@@ -844,13 +971,24 @@ def generate_video(
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    cli_args = list(args.cli_args)
+    if not has_cli_option(cli_args, "--video-source"):
+        cli_args = ["--video-source", DEFAULT_VIDEO_SOURCE, *cli_args]
+    if (
+        not has_cli_option(cli_args, "--match-materials-to-script")
+        and not has_cli_option(cli_args, "--no-match-materials-to-script")
+    ):
+        cli_args.append("--match-materials-to-script")
     root = args.root.expanduser().resolve()
     try:
+        cli_args = prepare_storyboard(cli_args)
         ensure_project(root)
+        verify_project_capabilities(root, cli_args)
         config_path = ensure_config(root)
         apply_environment_config(config_path)
-        reuse_existing_llm_provider(config_path)
-        provider, missing = missing_config(config_path, args.cli_args)
+        if needs_text_llm(cli_args):
+            reuse_existing_llm_provider(config_path)
+        provider, missing = missing_config(config_path, cli_args)
         if missing:
             write_result_manifest(
                 root,
@@ -861,7 +999,7 @@ def main(argv: list[str] | None = None) -> int:
                 },
             )
             return report_missing_config(provider, missing)
-        if not validate_pexels_config(config_path, args.cli_args):
+        if not validate_pexels_config(config_path, cli_args):
             write_result_manifest(
                 root,
                 {
@@ -872,7 +1010,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             return report_invalid_pexels_config()
         videos, task_dir, log_path, result_path = generate_video(
-            root, args.subject, args.cli_args
+            root, args.subject, cli_args
         )
     except (OSError, SkillError, urllib.error.URLError, zipfile.BadZipFile) as exc:
         print(f"MPT_ERROR={exc}", file=sys.stderr)

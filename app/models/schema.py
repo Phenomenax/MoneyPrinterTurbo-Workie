@@ -110,7 +110,7 @@ class VideoParams(BaseModel):
 
     video_subject: str
     video_script: str = ""  # Script used to generate the video
-    video_terms: Optional[str | List[str]] = None  # Keywords used to generate the video
+    video_terms: Optional[str | List[str]] = None  # Visual prompts or stock search terms
     video_aspect: Optional[VideoAspect] = VideoAspect.portrait.value
     video_fit_mode: VideoFitMode = VideoFitMode.cover
     image_motion: ImageMotion = ImageMotion.zoom
@@ -121,7 +121,7 @@ class VideoParams(BaseModel):
     match_materials_to_script: bool = False
     video_count: int = Field(default=1, ge=1)
 
-    video_source: Optional[str] = "pexels"
+    video_source: Optional[str] = "wan3"
     video_materials: Optional[List[MaterialInfo]] = (
         None  # Materials used to generate the video
     )

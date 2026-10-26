@@ -38,6 +38,7 @@ _BATCH_TASK_MAX_COUNT = 100
 # openai_image 只在单任务入口可用；集中定义后，新增 Provider 不会再次遗漏
 # 批量校验。这里仅包含 CLI 已公开支持的来源，不强行暴露 WebUI 专属流程。
 _CLI_VIDEO_SOURCES = (
+    "wan3",
     "pexels",
     "pixabay",
     "coverr",
@@ -320,6 +321,12 @@ Batch manifests:
         help="complete script; skips LLM script generation when provided",
     )
     content_group.add_argument(
+        "--storyboard",
+        default=None,
+        metavar="PATH",
+        help="Workie storyboard Markdown file; supplies narration and ordered visual prompts",
+    )
+    content_group.add_argument(
         "--video-terms",
         default=None,
         help="comma-separated material search terms; generated automatically when omitted",
@@ -351,7 +358,7 @@ Batch manifests:
     material_group = parser.add_argument_group("materials and pipeline")
     material_group.add_argument(
         "--video-source",
-        default="pexels",
+        default="wan3",
         choices=_CLI_VIDEO_SOURCES,
         help="video material provider; online providers require matching API keys in config.toml",
     )
@@ -715,6 +722,30 @@ Batch manifests:
         ),
     )
     args = parser.parse_args(argv)
+    args.storyboard_data = None
+    if args.storyboard is not None:
+        supplied = list(sys.argv[1:] if argv is None else argv)
+        if (args.video_terms is not None or args.video_script
+                or any(token.split("=", 1)[0] in {"--video-script", "--video-terms"} for token in supplied)):
+            parser.error("--storyboard cannot be combined with --video-script or --video-terms")
+        if args.batch_file:
+            parser.error("--storyboard cannot be combined with --batch-file")
+        if args.video_concat_mode == "random":
+            parser.error("--storyboard requires sequential concatenation")
+        if args.match_materials_to_script is False:
+            parser.error("--storyboard cannot disable material ordering")
+        from app.services.storyboard import parse_storyboard
+        try:
+            args.storyboard_data = parse_storyboard(args.storyboard)
+        except (OSError, ValueError) as exc:
+            parser.error(str(exc))
+        args.video_script = args.storyboard_data.video_script
+        args.video_terms = args.storyboard_data.video_terms
+        args.video_subject = args.video_subject.strip() or args.storyboard_data.title
+        args.video_aspect = args.video_aspect or args.storyboard_data.aspect
+        args.video_concat_mode = "sequential"
+        args.match_materials_to_script = True
+    args.video_aspect = args.video_aspect or "9:16"
 
     if (
         not args.batch_file
@@ -922,7 +953,7 @@ def build_video_params(args: argparse.Namespace) -> VideoParams:
     ui_config = config.ui
 
     video_terms = args.video_terms
-    if video_terms:
+    if isinstance(video_terms, str) and video_terms:
         video_terms = [
             term.strip() for term in re.split(r"[,，]", video_terms) if term.strip()
         ]
