@@ -16,13 +16,13 @@ Other defaults are one Chinese portrait (`9:16`) video, Chinese Edge TTS, subtit
 
 ## Execute
 
-Resolve the actual directory of this `SKILL.md`; the helper is adjacent. Set the terminal working directory to that directory and use the relative filename:
+Resolve the actual directory of this `SKILL.md`; the helper is adjacent. Set the terminal working directory to that directory (`workdir=SKILL_DIR`) and use the relative filename:
 
 ```text
-uv run --no-project --python 3.11 python mpt_agent.py --root "<Wan3-enabled MPT checkout>" --subject "<topic>" -- --storyboard "<absolute storyboard.md path>"
+uv run --no-project --python 3.11 python mpt_agent.py --subject "<topic>" -- --storyboard "<absolute storyboard.md path>"
 ```
 
-For local validation use `--root F:/TFZY/MoneyPrinterTurbo`. The default root remains `~/MoneyPrinterTurbo`, but it must contain the updated CLI supporting `wan3` and `--storyboard`. The fork archive URL has not yet been configured: missing or old installations produce an actionable error. Do not replace the helper with an upstream download or overwrite an existing installation silently.
+On a machine without MoneyPrinterTurbo, the helper downloads the public project archive into `~/MoneyPrinterTurbo`. Pass `--root` only to select a different installation directory. An existing valid project is reused and is not overwritten.
 
 Use the storyboard skill's fixed Markdown table and clean narration section. MPT extracts ordered `video_terms` and `video_script` from that file without rewriting them through a text model. The table's times guide planning; exact shot timing is not executed. Generic topic-only and explicit CLI inputs remain available when requested; forward other options after `--`.
 

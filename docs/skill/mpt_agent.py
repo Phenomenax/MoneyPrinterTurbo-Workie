@@ -22,7 +22,8 @@ from pathlib import Path
 
 
 PROJECT_ARCHIVE_URL = (
-    "https://github.com/harry0703/MoneyPrinterTurbo/archive/refs/heads/main.zip"
+    "https://github.com/Phenomenax/MoneyPrinterTurbo-Workie/archive/"
+    "e3b05a9f83dc839cb676982f76634d18fb49cf74.zip"
 )
 DEFAULT_ROOT = Path.home() / "MoneyPrinterTurbo"
 DEFAULT_VIDEO_SOURCE = "wan3"
@@ -138,22 +139,16 @@ def _safe_extract(archive: zipfile.ZipFile, destination: Path) -> None:
 
 
 def ensure_project(root: Path) -> None:
-    """Reuse an existing project or install it from the official GitHub archive."""
+    """Reuse an existing project or install it from the public GitHub archive."""
     root = root.expanduser().resolve()
     if (root / "cli.py").is_file() and (root / "config.example.toml").is_file():
         log(f"using existing project: {root}")
         return
     if root.exists() and any(root.iterdir()):
         raise SkillError(f"installation directory exists but is not a valid project: {root}")
-    if "github.com/harry0703/MoneyPrinterTurbo/" in PROJECT_ARCHIVE_URL:
-        raise SkillError(
-            "Wan3-enabled MoneyPrinterTurbo is not installed. Use --root to select "
-            "the updated checkout (for local validation: F:/TFZY/MoneyPrinterTurbo). "
-            "The fork archive URL is pending; the original upstream archive is not installed automatically."
-        )
 
     root.parent.mkdir(parents=True, exist_ok=True)
-    log(f"first-time installation: downloading the official project to {root}")
+    log(f"first-time installation: downloading MoneyPrinterTurbo to {root}")
     with tempfile.TemporaryDirectory(prefix="mpt-install-") as temp_dir_value:
         temp_dir = Path(temp_dir_value)
         archive_path = temp_dir / "MoneyPrinterTurbo.zip"
@@ -297,10 +292,6 @@ def apply_environment_config(config_path: Path) -> None:
     base_url = os.environ.get("MPT_LLM_BASE_URL", "").strip()
     model_name = os.environ.get("MPT_LLM_MODEL_NAME", "").strip()
     pexels_key = os.environ.get("MPT_PEXELS_API_KEY", "").strip()
-    pixabay_key = (
-        os.environ.get("MPT_PIXABAY_API_KEY", "").strip()
-        or os.environ.get("PIXABAY_API_KEY", "").strip()
-    )
     seedance_key = os.environ.get("MPT_VOLCENGINE_ARK_API_KEY", "").strip()
     ofox_key = os.environ.get("MPT_OFOX_API_KEY", "").strip()
     metaso_minimax_key = os.environ.get(
@@ -322,7 +313,6 @@ def apply_environment_config(config_path: Path) -> None:
             base_url,
             model_name,
             pexels_key,
-            pixabay_key,
             seedance_key,
             ofox_key,
             metaso_minimax_key,
@@ -351,9 +341,6 @@ def apply_environment_config(config_path: Path) -> None:
     if pexels_key:
         text = _replace_config_value(text, "pexels_api_keys", [pexels_key])
         changes.append("pexels_api_keys")
-    if pixabay_key:
-        text = _replace_config_value(text, "pixabay_api_keys", [pixabay_key])
-        changes.append("pixabay_api_keys")
     if seedance_key:
         text = _replace_config_value(
             text, "volcengine_seedance_api_key", seedance_key
@@ -647,8 +634,6 @@ def report_missing_config(provider: str, missing: list[str]) -> int:
     if "pexels_api_keys" in missing:
         print(f"PEXELS_API_KEY_URL={PEXELS_API_KEY_URL}")
         print(f"PEXELS_API_KEY_HELP_URL={PEXELS_API_KEY_HELP_URL}")
-    if "pixabay_api_keys" in missing:
-        print("PIXABAY_API_KEY_ENV=MPT_PIXABAY_API_KEY")
     if any(field.startswith("wan3_") for field in missing):
         print("WAN3_API_KEY_ENV=MPT_WAN3_API_KEY (or DASHSCOPE_API_KEY)")
         print("WAN3_BASE_URL_ENV=MPT_WAN3_BASE_URL")
