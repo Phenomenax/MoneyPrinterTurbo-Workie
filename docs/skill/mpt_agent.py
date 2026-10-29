@@ -96,10 +96,38 @@ ADDITIONAL_REUSABLE_PROVIDERS = (CUSTOM_OPENAI_PROVIDER,)
 class SkillError(RuntimeError):
     """An actionable Skill error that can be reported without a traceback."""
 
+    def __init__(self, message: str, *, stage: str | None = None):
+        super().__init__(message)
+        self.stage = stage
+
+
+def safe_feedback_text(value: object) -> str:
+    text = str(value or "")
+    text = re.sub(r"(https?://[^\s?]+)\?[^\s]+", r"\1?[redacted]", text)
+    text = re.sub(r"(?i)(bearer\s+)[\w.~+/=-]+", r"\1[redacted]", text)
+    text = re.sub(
+        r"""(?i)(["']?[\w-]*(?:api[_-]?key|token|secret|password|authorization)[\w-]*["']?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;}]+)""",
+        r"\1[redacted]", text,
+    )
+    text = re.sub(r"\bsk-[A-Za-z0-9_-]{10,}", "[redacted]", text)
+    return text[:1000]
+
+
+def emit_feedback(status: str, message: str, *, stage: str) -> None:
+    """Keep stdout concise so execute-output truncation preserves the failure."""
+    payload = {
+        "schema_version": 1, "status": status, "is_error": status == "failed",
+        "message": safe_feedback_text(message),
+        "execution": {"kind": "moneyprinterturbo", "stage": stage},
+    }
+    if status == "failed":
+        payload["error"] = {"code": "mpt_failed", "safe_to_resubmit": False}
+    print("MPT_FEEDBACK=" + json.dumps(payload, ensure_ascii=False), flush=True)
+
 
 def log(message: str) -> None:
     """Flush concise progress so the agent knows the long-running job started."""
-    print(f"[MoneyPrinterTurbo] {message}", flush=True)
+    print(f"[MoneyPrinterTurbo] {message}", file=sys.stderr, flush=True)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -877,9 +905,11 @@ def generate_video(
             result = subprocess.run(
                 command,
                 cwd=root,
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
+                stdout=subprocess.PIPE,
+                stderr=log_file,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 check=False,
             )
     except OSError as exc:
@@ -897,14 +927,30 @@ def generate_video(
             },
         )
         raise SkillError(error) from exc
-    if result.returncode != 0:
+    cli_result = {}
+    stdout = getattr(result, "stdout", "") or ""
+    if stdout:
+        with log_path.open("a", encoding="utf-8") as log_file:
+            log_file.write("\n" + stdout)
+        for line in reversed(stdout.splitlines()):
+            try:
+                candidate = json.loads(line)
+            except ValueError:
+                continue
+            if (isinstance(candidate, dict) and candidate.get("task_id") == task_id
+                    and isinstance(candidate.get("result"), dict)):
+                cli_result = candidate["result"]
+                break
+    if result.returncode != 0 or cli_result.get("failed_stage"):
         tail = log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-30:]
         if tail:
-            print("\n".join(tail), file=sys.stderr)
+            print(safe_feedback_text("\n".join(tail)), file=sys.stderr)
         error = (
             f"video generation failed with exit code {result.returncode}; "
             f"log: {log_path}"
         )
+        error = str(cli_result.get("error") or error)
+        failure_stage = str(cli_result.get("failed_stage") or "generation")
         write_result_manifest(
             root,
             {
@@ -917,7 +963,7 @@ def generate_video(
                 "error": error,
             },
         )
-        raise SkillError(error)
+        raise SkillError(safe_feedback_text(error), stage=failure_stage)
 
     videos = sorted(
         path.resolve()
@@ -964,16 +1010,20 @@ def main(argv: list[str] | None = None) -> int:
     ):
         cli_args.append("--match-materials-to-script")
     root = args.root.expanduser().resolve()
+    stage = "input_paths"
     try:
         cli_args = prepare_storyboard(cli_args)
+        stage = "project"
         ensure_project(root)
         verify_project_capabilities(root, cli_args)
+        stage = "configuration"
         config_path = ensure_config(root)
         apply_environment_config(config_path)
         if needs_text_llm(cli_args):
             reuse_existing_llm_provider(config_path)
         provider, missing = missing_config(config_path, cli_args)
         if missing:
+            emit_feedback("needs_input", "Missing configuration: " + ", ".join(missing), stage="configuration")
             write_result_manifest(
                 root,
                 {
@@ -984,6 +1034,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             return report_missing_config(provider, missing)
         if not validate_pexels_config(config_path, cli_args):
+            emit_feedback("needs_input", "Invalid configuration: pexels_api_keys", stage="configuration")
             write_result_manifest(
                 root,
                 {
@@ -993,11 +1044,15 @@ def main(argv: list[str] | None = None) -> int:
                 },
             )
             return report_invalid_pexels_config()
+        stage = "generation"
         videos, task_dir, log_path, result_path = generate_video(
             root, args.subject, cli_args
         )
-    except (OSError, SkillError, urllib.error.URLError, zipfile.BadZipFile) as exc:
-        print(f"MPT_ERROR={exc}", file=sys.stderr)
+    except Exception as exc:
+        failure_stage = getattr(exc, "stage", None) or stage
+        emit_feedback("failed", str(exc), stage=failure_stage)
+        print(f"MPT_ERROR_STAGE={failure_stage}", file=sys.stderr)
+        print(f"MPT_ERROR={safe_feedback_text(exc)}", file=sys.stderr)
         return 1
 
     print("MPT_RESULT")

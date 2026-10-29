@@ -1812,6 +1812,9 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
         logger.exception(
             f"CLI task failed with an unexpected error: task_id={task_id}, error={exc}"
         )
+        print(json.dumps({"task_id": task_id, "result": {
+            "state": tm.const.TASK_STATE_FAILED, "failed_stage": "runtime", "error": str(exc),
+        }}, ensure_ascii=False))
         return 1
     if not result or result.get("state") == tm.const.TASK_STATE_FAILED:
         failed_stage = result.get("failed_stage", "unknown") if result else "unknown"
@@ -1820,8 +1823,9 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
             f"CLI task failed: task_id={task_id}, stop_at={args.stop_at}, "
             f"stage={failed_stage}, error={error}"
         )
-        if result and result.get("videos"):
-            print(json.dumps({"task_id": task_id, "result": result}, ensure_ascii=False))
+        print(json.dumps({"task_id": task_id, "result": result or {
+            "state": tm.const.TASK_STATE_FAILED, "failed_stage": failed_stage, "error": error,
+        }}, ensure_ascii=False))
         return 1
 
     print(json.dumps({"task_id": task_id, "result": result}, ensure_ascii=False))

@@ -188,7 +188,8 @@ class TestCli(unittest.TestCase):
             code = cli.run_cli(["--video-subject", "失败场景"])
 
         self.assertEqual(code, 1)
-        print_mock.assert_not_called()
+        payload = json.loads(print_mock.call_args.args[0])
+        self.assertEqual(payload, {"task_id": "task-structured-failure", "result": failure})
         self.assertIn("stage=audio", log_error.call_args.args[0])
         self.assertIn("TTS request timed out", log_error.call_args.args[0])
 

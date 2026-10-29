@@ -977,7 +977,7 @@ class TestMptAgentSkill(unittest.TestCase):
             stderr = io.StringIO()
 
             def reject_model(command, **kwargs):
-                kwargs["stdout"].write(model_error + "\n")
+                kwargs["stderr"].write(model_error + "\n")
                 return SimpleNamespace(returncode=1)
 
             with (
