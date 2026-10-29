@@ -22,8 +22,7 @@ from pathlib import Path
 
 
 PROJECT_ARCHIVE_URL = (
-    "https://github.com/Phenomenax/MoneyPrinterTurbo-Workie/archive/"
-    "e3b05a9f83dc839cb676982f76634d18fb49cf74.zip"
+    "https://github.com/harry0703/MoneyPrinterTurbo/archive/refs/heads/main.zip"
 )
 DEFAULT_ROOT = Path.home() / "MoneyPrinterTurbo"
 DEFAULT_VIDEO_SOURCE = "wan3"
