@@ -736,7 +736,10 @@ Batch manifests:
             parser.error("--storyboard cannot disable material ordering")
         from app.services.storyboard import parse_storyboard
         try:
-            args.storyboard_data = parse_storyboard(args.storyboard)
+            args.storyboard_data = parse_storyboard(
+                args.storyboard,
+                require_shot_timing=True,
+            )
         except (OSError, ValueError) as exc:
             parser.error(str(exc))
         args.video_script = args.storyboard_data.video_script
@@ -1802,6 +1805,8 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
             # Preserve support for arbitrary local audio paths without weakening the
             # task service's secure default for API and WebUI callers.
             allow_server_file_input=True,
+            storyboard_data=args.storyboard_data,
+            storyboard_clip_duration=args.video_clip_duration,
         )
     except Exception as exc:
         logger.exception(

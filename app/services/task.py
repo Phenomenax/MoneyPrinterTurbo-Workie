@@ -29,6 +29,7 @@ from app.services import (
     subtitle,
     task_artifacts,
     twelvelabs,
+    storyboard_timing,
     video,
     volcengine_seedance,
     voice,
@@ -722,12 +723,34 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
         return final_subtitle_path
 
 
+def _all_storyboard_shots_silent(storyboard_data) -> bool:
+    shots = tuple(getattr(storyboard_data, "shots", ()) or ())
+    return bool(shots) and all(not (getattr(shot, "narration", "") or "").strip() for shot in shots)
+
+
+def _reject_storyboard_external_audio(params, voice_preview) -> None:
+    """External audio needs explicit alignment before it can drive per-shot timing."""
+    custom_audio = str(getattr(params, "custom_audio_file", "") or "").strip()
+    if custom_audio:
+        raise storyboard_timing.StoryboardTimingError(
+            "audio",
+            "storyboard timing cannot use one external audio file for the whole video; "
+            "provide per-shot audio or alignment information",
+        )
+    if voice_preview:
+        raise storyboard_timing.StoryboardTimingError(
+            "audio",
+            "storyboard timing cannot reuse a voice preview without supported per-shot alignment",
+        )
+
+
 def get_video_materials(
     task_id,
     params,
     video_terms,
     audio_duration,
     loomloom_video_request: loomloom.LoomLoomConfirmedVideoRequest | None = None,
+    shot_plan: list | None = None,
 ):
     if params.video_source == "local":
         logger.info("\n\n## preprocess local materials")
@@ -842,10 +865,18 @@ def get_video_materials(
                     if params.match_materials_to_script
                     else params.video_concat_mode
                 ),
-                audio_duration=audio_duration * params.video_count * (max(1, utils.normalize_clip_speed(params.video_clip_speed)) if params.video_source == "wan3" else 1),
+                audio_duration=(
+                    audio_duration
+                    if shot_plan is not None
+                    else audio_duration * params.video_count * (
+                        max(1, utils.normalize_clip_speed(params.video_clip_speed))
+                        if params.video_source == "wan3" else 1
+                    )
+                ),
                 max_clip_duration=params.video_clip_duration,
                 match_script_order=params.match_materials_to_script,
                 image_motion=params.image_motion,
+                shot_plan=shot_plan,
                 # 素材阶段占用 40%~50%：每下完一个文件推进一次，慢速网络下
                 # 进度条不再长时间停在 40%。
                 progress_callback=_stage_progress_reporter(task_id, 40, 50),
@@ -1014,6 +1045,7 @@ def _get_material_source_groups(task_id: str, video_paths: list[str]) -> dict[st
 def generate_final_videos(
     task_id, params, downloaded_videos, audio_file, subtitle_path, audio_duration,
     *, partial_results: dict | None = None,
+    shot_plan: list | None = None,
 ):
     """Record completed outputs even if a later clip raises before returning."""
     final_video_paths = []
@@ -1051,7 +1083,7 @@ def generate_final_videos(
         video_concat_mode = VideoConcatMode.random
     video_transition_mode = params.video_transition_mode
     max_clip_duration = params.video_clip_duration
-    if params.video_source == "wan3" and downloaded_videos:
+    if shot_plan is None and params.video_source == "wan3" and downloaded_videos:
         # combine_videos interprets this cap as playback seconds and handles
         # speed internally. Spread scenes across the narration so later shots
         # are not discarded when the supplied storyboard has many short beats.
@@ -1092,6 +1124,7 @@ def generate_final_videos(
             progress_callback=_stage_progress_reporter(
                 task_id, _progress, _progress + combine_share
             ),
+            storyboard_shot_plan=shot_plan,
             **batch_options,
         )
         if allocate_batch_materials:
@@ -1566,6 +1599,8 @@ def _run_pipeline(
     voxcpm_reference_audio: bytes | None = None,
     voxcpm_prompt_audio: bytes | None = None,
     voxcpm_prompt_text: str = "",
+    storyboard_data=None,
+    storyboard_clip_duration: int | None = None,
 ):
     logger.info(f"start task: {task_id}, stop_at: {stop_at}")
     sm.state.update_task(
@@ -1573,6 +1608,17 @@ def _run_pipeline(
         failed_stage=None, error=None,
         videos=[], combined_videos=[], warnings=None, failed_video_index=None,
     )
+
+    use_storyboard_timing = storyboard_data is not None
+    storyboard_options = {}
+    if use_storyboard_timing:
+        if not storyboard_data.shots:
+            return _mark_task_failed(task_id, "preflight", "storyboard has no timed shots")
+        if stop_at in {"materials", "video"}:
+            try:
+                storyboard_options = material.storyboard_generation_options(params.video_source)
+            except ValueError as exc:
+                return _mark_task_failed(task_id, "preflight", str(exc))
 
     if stop_at == "video" and params.subtitle_enabled:
         try:
@@ -1587,7 +1633,7 @@ def _run_pipeline(
 
     if stop_at in {"materials", "video"} and params.video_source == "wan3":
         try:
-            if not 2 <= params.video_clip_duration <= 30:
+            if not wan3.MIN_CLIP_SECONDS <= params.video_clip_duration <= wan3.MAX_CLIP_SECONDS:
                 raise wan3.Wan3Error("Wan3 clip duration must be an integer from 2 to 30 seconds")
             wan3.validate_config()
         except wan3.Wan3Error as exc:
@@ -1704,16 +1750,23 @@ def _run_pipeline(
         )
 
     # 1. Generate script
-    video_script = generate_script(task_id, params)
+    storyboard_timeline = None
+    if use_storyboard_timing and _all_storyboard_shots_silent(storyboard_data):
+        video_script = (params.video_script or "").strip()
+        logger.info("storyboard has no spoken lines; silent shots keep their planned duration")
+    else:
+        video_script = generate_script(task_id, params)
     # The LLM adapter uses a leading "Error: " as its failure sentinel. A
     # user-provided script may legitimately quote that text anywhere, including
     # at the beginning, so only interpret it for an LLM-generated script.
     is_provider_error = (
-        not (params.video_script or "").strip()
+        not use_storyboard_timing
+        and not (params.video_script or "").strip()
         and isinstance(video_script, str)
         and video_script.startswith("Error: ")
     )
-    if not video_script or is_provider_error:
+    silent_storyboard = use_storyboard_timing and _all_storyboard_shots_silent(storyboard_data)
+    if not silent_storyboard and (not video_script or is_provider_error):
         error = (
             video_script.removeprefix("Error: ").strip()
             if is_provider_error
@@ -1735,7 +1788,9 @@ def _run_pipeline(
     # prompts bypass this LLM step and keep their exact order.
     defer_wan3_prompts = (params.video_source == "wan3" and not params.video_terms
                          and stop_at in {"materials", "video"})
-    if (stop_at in {"terms", "materials", "video"} and params.video_source != "local"
+    if use_storyboard_timing:
+        video_terms = [shot.prompt for shot in storyboard_data.shots]
+    elif (stop_at in {"terms", "materials", "video"} and params.video_source != "local"
             and not defer_wan3_prompts):
         video_terms = generate_terms(task_id, params, video_script)
         if not video_terms:
@@ -1765,12 +1820,31 @@ def _run_pipeline(
     if voxcpm_prompt_audio is not None:
         generate_audio_kwargs["voxcpm_prompt_audio"] = voxcpm_prompt_audio
         generate_audio_kwargs["voxcpm_prompt_text"] = voxcpm_prompt_text
-    audio_file, audio_duration, sub_maker = generate_audio(
-        task_id,
-        params,
-        video_script,
-        **generate_audio_kwargs,
-    )
+    if use_storyboard_timing:
+        try:
+            _reject_storyboard_external_audio(params, voice_preview)
+            storyboard_timeline = storyboard_timing.synthesize_timeline(
+                task_dir=utils.task_dir(task_id),
+                shots=storyboard_data.shots,
+                voice_name=params.voice_name,
+                voice_rate=params.voice_rate,
+                voxcpm_reference_audio=voxcpm_reference_audio,
+                voxcpm_prompt_audio=voxcpm_prompt_audio,
+                voxcpm_prompt_text=voxcpm_prompt_text,
+            )
+            task_artifacts.patch_script_data(task_id, **storyboard_timeline.script_updates())
+        except storyboard_timing.StoryboardTimingError as exc:
+            return _mark_task_failed(task_id, exc.stage, str(exc))
+        audio_file = storyboard_timeline.audio_path
+        audio_duration = storyboard_timeline.calibrated_total_seconds
+        sub_maker = None
+    else:
+        audio_file, audio_duration, sub_maker = generate_audio(
+            task_id,
+            params,
+            video_script,
+            **generate_audio_kwargs,
+        )
     if not audio_file:
         return _mark_task_failed(
             task_id,
@@ -1810,9 +1884,22 @@ def _run_pipeline(
         return {"audio_file": audio_file, "audio_duration": audio_duration}
 
     # 4. Generate subtitle
-    subtitle_path = generate_subtitle(
-        task_id, params, video_script, sub_maker, audio_file
-    )
+    if use_storyboard_timing:
+        subtitle_provider = str(config.app.get("subtitle_provider", "edge") or "edge")
+        try:
+            subtitle_path = storyboard_timing.write_storyboard_subtitles(
+                storyboard_timeline,
+                subtitle_path=path.join(utils.task_dir(task_id), "subtitle.srt"),
+                subtitle_enabled=bool(params.subtitle_enabled),
+                subtitle_provider=subtitle_provider,
+                word_level=getattr(params, "subtitle_display_mode", "sentence") == "word_by_word",
+            )
+        except storyboard_timing.StoryboardTimingError as exc:
+            return _mark_task_failed(task_id, exc.stage, str(exc))
+    else:
+        subtitle_path = generate_subtitle(
+            task_id, params, video_script, sub_maker, audio_file
+        )
 
     if stop_at == "subtitle":
         if not subtitle_path:
@@ -1831,7 +1918,7 @@ def _run_pipeline(
 
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=40)
 
-    if defer_wan3_prompts:
+    if defer_wan3_prompts and not use_storyboard_timing:
         amount = max(1, math.ceil(audio_duration * params.video_count
                                  * max(1, utils.normalize_clip_speed(params.video_clip_speed))
                                  / params.video_clip_duration))
@@ -1840,6 +1927,21 @@ def _run_pipeline(
             return _mark_task_failed(task_id, "terms", "failed to generate video scene prompts")
         save_script_data(task_id, video_script, video_terms, params)
 
+    shot_plan = None
+    if use_storyboard_timing:
+        try:
+            storyboard_timing.build_generation_plan(
+                storyboard_timeline,
+                clip_speed=params.video_clip_speed,
+                explicit_clip_duration=storyboard_clip_duration,
+                **storyboard_options,
+            )
+        except storyboard_timing.StoryboardTimingError as exc:
+            task_artifacts.patch_script_data(task_id, **storyboard_timeline.script_updates())
+            return _mark_task_failed(task_id, exc.stage, str(exc))
+        task_artifacts.patch_script_data(task_id, **storyboard_timeline.script_updates())
+        shot_plan = storyboard_timeline.shots
+
     # 5. Get video materials
     downloaded_videos = get_video_materials(
         task_id,
@@ -1847,7 +1949,10 @@ def _run_pipeline(
         video_terms,
         audio_duration,
         loomloom_video_request=loomloom_video_request,
+        shot_plan=shot_plan,
     )
+    if use_storyboard_timing and storyboard_timeline is not None:
+        task_artifacts.patch_script_data(task_id, **storyboard_timeline.script_updates())
     if not downloaded_videos:
         return _mark_task_failed(
             task_id,
@@ -1882,6 +1987,7 @@ def _run_pipeline(
             subtitle_path,
             audio_duration,
             partial_results=partial_results,
+            shot_plan=shot_plan,
         )
     except Exception as exc:
         logger.exception(f"video batch failed, task_id: {task_id}, error: {exc}")
@@ -1976,6 +2082,8 @@ def start(
     voxcpm_reference_audio: bytes | None = None,
     voxcpm_prompt_audio: bytes | None = None,
     voxcpm_prompt_text: str = "",
+    storyboard_data=None,
+    storyboard_clip_duration: int | None = None,
 ):
     """
     执行任务流水线，并确保未预期异常也会转换成可查询的失败状态。
@@ -1994,6 +2102,8 @@ def start(
             voxcpm_reference_audio=voxcpm_reference_audio,
             voxcpm_prompt_audio=voxcpm_prompt_audio,
             voxcpm_prompt_text=voxcpm_prompt_text,
+            storyboard_data=storyboard_data,
+            storyboard_clip_duration=storyboard_clip_duration,
         )
     except Exception as exc:
         logger.exception(

@@ -26,6 +26,7 @@ from moviepy import (
     TextClip,
     VideoFileClip,
     afx,
+    concatenate_videoclips,
 )
 from moviepy.video.tools.subtitles import SubtitlesClip
 from PIL import Image, ImageColor, ImageDraw, ImageFont, ImageOps
@@ -970,6 +971,161 @@ def _fit_clip_to_canvas(
     ).with_duration(clip.duration)
 
 
+def _apply_storyboard_transition(clip, transition_value: str):
+    """Apply a visual transition without letting it move the shot boundary."""
+    transition_duration = min(1.0, float(clip.duration or 0))
+    shuffle_side = random.choice(["left", "right", "top", "bottom"])
+    if transition_value == VideoTransitionMode.fade_in.value:
+        return video_effects.fadein_transition(clip, transition_duration)
+    if transition_value == VideoTransitionMode.fade_out.value:
+        return video_effects.fadeout_transition(clip, transition_duration)
+    if transition_value == VideoTransitionMode.slide_in.value:
+        return video_effects.slidein_transition(clip, transition_duration, shuffle_side)
+    if transition_value == VideoTransitionMode.slide_out.value:
+        return video_effects.slideout_transition(clip, transition_duration, shuffle_side)
+    if transition_value == VideoTransitionMode.zoom_in.value:
+        return video_effects.zoomin_transition(clip, 1)
+    if transition_value == VideoTransitionMode.zoom_out.value:
+        return video_effects.zoomout_transition(clip, 1)
+    if transition_value == VideoTransitionMode.shuffle.value:
+        transition = random.choice([
+            lambda current: video_effects.fadein_transition(current, transition_duration),
+            lambda current: video_effects.fadeout_transition(current, transition_duration),
+            lambda current: video_effects.slidein_transition(current, transition_duration, shuffle_side),
+            lambda current: video_effects.slideout_transition(current, transition_duration, shuffle_side),
+            lambda current: video_effects.zoomin_transition(current, 1),
+            lambda current: video_effects.zoomout_transition(current, 1),
+        ])
+        return transition(clip)
+    return clip
+
+
+def _fit_storyboard_playback(clip, target_seconds: float):
+    """Trim or extend one shot to its frame boundary. Only a one-frame gap may be cloned."""
+    duration = float(clip.duration or 0)
+    if duration > target_seconds + 1e-3:
+        return clip.subclipped(0, target_seconds)
+    gap = target_seconds - duration
+    if gap <= 1e-3:
+        return clip
+    if gap > (1.0 / fps) + 1e-3:
+        raise RuntimeError(
+            f"storyboard shot is short by {gap:.3f}s after playback speed; "
+            "it was not padded from another shot"
+        )
+    last_time = min(max(duration - (1.0 / fps), 0.0), max(duration - 1e-3, 0.0))
+    frame = clip.get_frame(last_time)
+    pad = ImageClip(frame).with_duration(gap).with_fps(fps)
+    fitted = concatenate_videoclips([clip, pad], method="compose")
+    if fitted.duration > target_seconds + 1e-3:
+        return fitted.subclipped(0, target_seconds)
+    return fitted
+
+
+def _combine_storyboard_shots(
+    combined_video_path: str,
+    video_paths: List[str],
+    shot_plan: list,
+    *,
+    video_aspect: VideoAspect,
+    video_transition_mode: VideoTransitionMode,
+    threads: int,
+    clip_speed: float,
+    video_fit_mode: VideoFitMode,
+    used_video_paths: List[str] | None,
+    progress_callback: Callable[[float], None] | None,
+) -> str:
+    """Cut one source per shot. Do not equalize shots or loop footage to fill time."""
+    if len(video_paths) != len(shot_plan):
+        raise RuntimeError(
+            "storyboard materials do not match the shot timeline: "
+            f"materials={len(video_paths)}, shots={len(shot_plan)}"
+        )
+    transition_value = getattr(video_transition_mode, "value", video_transition_mode) or ""
+    speed = utils.normalize_clip_speed(clip_speed)
+    aspect = VideoAspect(video_aspect)
+    fit_mode = VideoFitMode(video_fit_mode)
+    video_width, video_height = aspect.to_resolution()
+    output_dir = os.path.dirname(combined_video_path)
+    clip_files: list[str] = []
+    try:
+        for index, (video_path, plan) in enumerate(zip(video_paths, shot_plan)):
+            target = float(plan.target_playback_seconds)
+            required_source = float(getattr(plan, "required_source_seconds", target * speed) or target * speed)
+            source_clip = None
+            clip = None
+            clip_file = None
+            try:
+                source_clip = _open_video_clip_quietly(video_path, audio=False)
+                source_duration = float(source_clip.duration or 0)
+                allowed_shortfall = (1.0 / fps) * (required_source / target if target > 0 else 1.0)
+                if source_duration + allowed_shortfall + 1e-4 < required_source:
+                    raise RuntimeError(
+                        f"shot {getattr(plan, 'index', index + 1)} material is too short: "
+                        f"available={source_duration:.3f}s, required={required_source:.3f}s. "
+                        "No additional paid generation was submitted."
+                    )
+                source_end = min(source_duration, required_source)
+                clip = source_clip.subclipped(0, source_end)
+                if speed != 1.0:
+                    clip = clip.with_speed_scaled(speed)
+                clip_w, clip_h = clip.size
+                if clip_w != video_width or clip_h != video_height:
+                    clip = _fit_clip_to_canvas(
+                        clip,
+                        target_width=video_width,
+                        target_height=video_height,
+                        fit_mode=fit_mode,
+                    )
+                if transition_value and transition_value != VideoTransitionMode.none.value:
+                    clip = _apply_storyboard_transition(clip, transition_value)
+                clip = _fit_storyboard_playback(clip, target)
+                with tempfile.NamedTemporaryFile(
+                    dir=output_dir or ".", prefix="temp-clip-", suffix=".mp4", delete=False
+                ) as temporary_clip:
+                    clip_file = temporary_clip.name
+                _write_videofile_with_codec_fallback(
+                    clip,
+                    clip_file,
+                    codec=_get_configured_video_codec(),
+                    logger=None,
+                    fps=fps,
+                    threads=threads,
+                    # MoviePy can round a fractional duration down by one frame.
+                    # Lock the frame count in this encode instead of transcoding again.
+                    ffmpeg_params=[
+                        "-vf", f"{_BT709_VIDEO_FILTER},tpad=stop_mode=clone:stop=1",
+                        "-frames:v", str(int(round(target * fps))),
+                    ],
+                )
+                clip_files.append(clip_file)
+                clip_file = None
+                if used_video_paths is not None:
+                    used_video_paths.append(video_path)
+                if progress_callback is not None:
+                    try:
+                        progress_callback((index + 1) / len(shot_plan))
+                    except Exception as exc:
+                        logger.warning(f"storyboard combine progress failed: {type(exc).__name__}")
+            finally:
+                close_clip(clip if clip is not None else source_clip)
+                if clip_file:
+                    delete_files(clip_file)
+        if len(clip_files) != len(shot_plan):
+            raise RuntimeError("storyboard combine dropped a shot")
+        concat_video_clips_with_ffmpeg(
+            clip_files=clip_files,
+            output_file=combined_video_path,
+            threads=threads,
+            output_dir=output_dir,
+            max_duration=None,
+        )
+    finally:
+        delete_files(clip_files)
+    logger.info(f"storyboard video combining completed: shots={len(shot_plan)}")
+    return combined_video_path
+
+
 def combine_videos(
     combined_video_path: str,
     video_paths: List[str],
@@ -985,7 +1141,21 @@ def combine_videos(
     source_groups: dict[str, str] | None = None,
     used_video_paths: List[str] | None = None,
     progress_callback: Callable[[float], None] | None = None,
+    storyboard_shot_plan: list | None = None,
 ) -> str:
+    if storyboard_shot_plan is not None:
+        return _combine_storyboard_shots(
+            combined_video_path,
+            video_paths,
+            storyboard_shot_plan,
+            video_aspect=video_aspect,
+            video_transition_mode=video_transition_mode,
+            threads=threads,
+            clip_speed=clip_speed,
+            video_fit_mode=video_fit_mode,
+            used_video_paths=used_video_paths,
+            progress_callback=progress_callback,
+        )
     # Pydantic leaves this optional default as the string "random" unless
     # explicitly provided. Normalize it once for all downstream enum access.
     video_concat_mode = VideoConcatMode(video_concat_mode or VideoConcatMode.random)

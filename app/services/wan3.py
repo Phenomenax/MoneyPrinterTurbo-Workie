@@ -18,6 +18,8 @@ from app.utils.request_logging import trace_http_call
 
 
 DEFAULT_MODEL_NAME = "wan3.0-video"
+MIN_CLIP_SECONDS = 2
+MAX_CLIP_SECONDS = 30
 DEFAULT_POLL_INTERVAL_SECONDS = 15.0
 DEFAULT_RUN_TIMEOUT_SECONDS = 1200.0
 MAX_POLL_RETRIES = 5
@@ -167,7 +169,7 @@ def generate_videos(
     if (
         isinstance(minimum_duration, bool)
         or not isinstance(minimum_duration, int)
-        or not 2 <= minimum_duration <= 30
+        or not MIN_CLIP_SECONDS <= minimum_duration <= MAX_CLIP_SECONDS
     ):
         raise Wan3Error("Wan3 clip duration must be an integer from 2 to 30 seconds")
 
