@@ -35,6 +35,34 @@ class TestCli(unittest.TestCase):
 
         self.assertEqual(params.voice_name, "zh-CN-XiaoxiaoNeural-Female")
 
+    def test_video_aspect_prefers_cli_then_storyboard_then_portrait(self):
+        storyboard = (
+            "# Storyboard — Coffee\n\n"
+            "{metadata}\n\n"
+            "## Beats (timed)\n\n"
+            "| Time | Shot type | On-screen / B-roll | VO / on-camera line | Music / SFX |\n"
+            "| --- | --- | --- | --- | --- |\n"
+            "| 0:00–0:05 | Close | Coffee cup | Hello | bed |\n\n"
+            "## Voiceover script (clean, ready to paste)\n\nHello\n"
+        )
+        cases = (
+            (None, [], "9:16"),
+            (None, ["--video-aspect", "1:1"], "1:1"),
+            ("**Aspect:** 16:9", [], "16:9"),
+            ("**Aspect:** 16:9", ["--video-aspect", "9:16"], "9:16"),
+            ("", [], "9:16"),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            board = Path(tmp) / "storyboard.md"
+            for metadata, options, expected in cases:
+                with self.subTest(metadata=metadata, options=options):
+                    argv = ["--video-subject", "Coffee", *options]
+                    if metadata is not None:
+                        board.write_text(storyboard.format(metadata=metadata), encoding="utf-8")
+                        argv.extend(["--storyboard", str(board)])
+                    params = cli.build_video_params(cli.parse_args(argv))
+                    self.assertEqual(params.video_aspect.value, expected)
+
     def test_video_fit_mode_defaults_to_cover_and_accepts_contain(self):
         default_params = cli.build_video_params(
             cli.parse_args(["--video-subject", "test"])

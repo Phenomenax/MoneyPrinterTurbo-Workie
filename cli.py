@@ -429,8 +429,8 @@ Batch manifests:
     video_group.add_argument(
         "--video-aspect",
         choices=["9:16", "16:9", "1:1"],
-        default="9:16",
-        help="output aspect ratio: portrait, landscape, or square",
+        default=None,
+        help="output aspect ratio: portrait, landscape, or square (default: storyboard Aspect, otherwise 9:16)",
     )
     video_group.add_argument(
         "--video-fit-mode",
