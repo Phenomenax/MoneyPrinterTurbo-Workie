@@ -705,6 +705,10 @@ Batch manifests:
     )
 
     execution_group = parser.add_argument_group("execution")
+    execution_group.add_argument(
+        "--progress-file", default=None, metavar="PATH",
+        help="optional atomic JSON progress snapshot for a single CLI task",
+    )
     execution_mode = execution_group.add_mutually_exclusive_group()
     execution_mode.add_argument(
         "--task-id",
@@ -722,6 +726,8 @@ Batch manifests:
         ),
     )
     args = parser.parse_args(argv)
+    if args.progress_file and args.batch_file:
+        parser.error("--progress-file is only supported for a single task")
     args.storyboard_data = None
     if args.storyboard is not None:
         supplied = list(sys.argv[1:] if argv is None else argv)
@@ -1796,6 +1802,14 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
 
     task_id = args.task_id or utils.get_uuid()
     logger.info(f"start CLI task: task_id={task_id}, stop_at={args.stop_at}")
+    reporter = None
+    succeeded = False
+    if args.progress_file:
+        from app.services.progress import TaskProgress
+        from app.services import state as sm
+
+        reporter = TaskProgress(args.progress_file, task_id, sm.state)
+        reporter.start()
     try:
         result = tm.start(
             task_id=task_id,
@@ -1808,6 +1822,7 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
             storyboard_data=args.storyboard_data,
             storyboard_clip_duration=args.video_clip_duration,
         )
+        succeeded = bool(result) and result.get("state") != tm.const.TASK_STATE_FAILED
     except Exception as exc:
         logger.exception(
             f"CLI task failed with an unexpected error: task_id={task_id}, error={exc}"
@@ -1816,6 +1831,9 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
             "state": tm.const.TASK_STATE_FAILED, "failed_stage": "runtime", "error": str(exc),
         }}, ensure_ascii=False))
         return 1
+    finally:
+        if reporter is not None:
+            reporter.finish(succeeded)
     if not result or result.get("state") == tm.const.TASK_STATE_FAILED:
         failed_stage = result.get("failed_stage", "unknown") if result else "unknown"
         error = result.get("error", "unknown task error") if result else "empty result"

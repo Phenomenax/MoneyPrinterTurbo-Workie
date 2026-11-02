@@ -2197,13 +2197,14 @@ def download_videos(
     image_motion: ImageMotion = ImageMotion.zoom,
     on_task_created: Callable[[str], None] | None = None,
     shot_plan: list | None = None,
+    on_clip_completed: Callable[[int, int], None] | None = None,
 ) -> List[str]:
     """
     搜索并下载覆盖配音时长所需的素材，返回本地文件路径。
 
-    ``progress_callback`` 可选：库存素材（Pexels、Pixabay、Coverr）每下完一个
-    文件就以 0~1 的完成比例调用一次，供任务层推进进度条。按需生成的付费
-    素材源不报告下载进度。
+    ``progress_callback`` 可选：库存素材和 Wan3 在完成下载后报告比例。
+    ``on_clip_completed`` 仅供 Wan3 报告已通过校验的画面素材数量；
+    其他付费素材源保持现有行为。
     """
     source = source or "wan3"
     provider = "pexels"
@@ -2243,6 +2244,7 @@ def download_videos(
             material_directory=material_directory,
             on_task_created=on_task_created,
             progress_callback=progress_callback,
+            **({"on_clip_completed": on_clip_completed} if source == "wan3" else {}),
         )
     if source == "wan3":
         return _download_videos_wan3_on_demand(
@@ -2254,6 +2256,7 @@ def download_videos(
             material_directory=material_directory,
             on_task_created=on_task_created,
             progress_callback=progress_callback,
+            on_clip_completed=on_clip_completed,
         )
     if source == "wavespeed":
         # AI 生成按条计费，不能沿用库存源"先为全部关键词取回候选、再挑选"
@@ -2826,6 +2829,14 @@ def _generate_wan3_materials(
         yield saved_path, duration, record, remote_task_id
 
 
+def _report_wan3_count(callback, completed: int, total: int) -> None:
+    if callback is not None:
+        try:
+            callback(completed, total)
+        except Exception as exc:
+            logger.warning(f"Wan3 count callback failed: error={type(exc).__name__}")
+
+
 def _download_storyboard_wan3(
     *,
     task_id: str,
@@ -2834,6 +2845,7 @@ def _download_storyboard_wan3(
     material_directory: str,
     on_task_created: Callable[[str], None] | None = None,
     progress_callback: Callable[[float], None] | None = None,
+    on_clip_completed: Callable[[int, int], None] | None = None,
 ) -> List[str]:
     """Generate one Wan3 clip per storyboard shot. Validate every request first."""
     plans = list(shot_plan)
@@ -2853,6 +2865,7 @@ def _download_storyboard_wan3(
 
     paths: List[str] = []
     sources: list[dict[str, Any]] = []
+    _report_wan3_count(on_clip_completed, 0, len(plans))
     try:
         for offset, plan in enumerate(plans, start=1):
             try:
@@ -2894,6 +2907,7 @@ def _download_storyboard_wan3(
                 except Exception as exc:
                     logger.warning(f"Wan3 progress callback failed: error={type(exc).__name__}")
             _persist_material_sources(task_id, sources)
+            _report_wan3_count(on_clip_completed, offset, len(plans))
     except Exception:
         _persist_material_sources(task_id, sources)
         raise
@@ -2911,6 +2925,7 @@ def _download_videos_wan3_on_demand(
     material_directory: str,
     on_task_created: Callable[[str], None] | None = None,
     progress_callback: Callable[[float], None] | None = None,
+    on_clip_completed: Callable[[int, int], None] | None = None,
 ) -> List[str]:
     """Generate each ordered visual prompt once, then verify actual coverage."""
     try:
@@ -2935,8 +2950,9 @@ def _download_videos_wan3_on_demand(
     paths: List[str] = []
     sources: list[dict[str, Any]] = []
     total_duration = 0.0
+    _report_wan3_count(on_clip_completed, 0, len(search_terms))
     try:
-        for term in search_terms:
+        for offset, term in enumerate(search_terms, start=1):
             for saved_path, duration, record, _remote_task_id in _generate_wan3_materials(
                 task_id=task_id,
                 prompt=term,
@@ -2954,6 +2970,7 @@ def _download_videos_wan3_on_demand(
                     except Exception as exc:
                         logger.warning(f"Wan3 progress callback failed: error={type(exc).__name__}")
                 _persist_material_sources(task_id, sources)
+            _report_wan3_count(on_clip_completed, offset, len(search_terms))
         if total_duration + 0.001 < required_duration:
             raise wan3.Wan3Error(
                 "Wan3 ordered materials do not cover the narration after actual-duration validation: "

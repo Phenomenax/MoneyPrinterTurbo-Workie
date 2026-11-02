@@ -297,7 +297,8 @@ def _mark_task_failed(
     # return value used by the CLI. These fields are reset before a new attempt.
     failure_details = {
         key: existing_task[key]
-        for key in ("videos", "combined_videos", "warnings", "failed_video_index")
+        for key in ("videos", "combined_videos", "warnings", "failed_video_index",
+                    "stage", "clips_completed", "clips_total")
         if existing_task and key in existing_task
     }
     failure_details.update({
@@ -325,6 +326,14 @@ def _mark_task_failed(
     # A state outage must not discard the only completed-file snapshot held by
     # the caller. Return it even when all bounded persistence attempts fail.
     return failure
+
+
+def _report_task_details(task_id: str, **details):
+    """Progress metadata is best effort and must not affect paid work."""
+    try:
+        sm.state.patch_task(task_id, **details)
+    except Exception as exc:
+        logger.warning(f"Task progress metadata unavailable: {type(exc).__name__}")
 
 
 def _stage_progress_reporter(task_id: str, stage_start: float, stage_end: float):
@@ -853,7 +862,12 @@ def get_video_materials(
             )
             if not reference_saved and not script_saved:
                 raise RuntimeError("could not persist the Wan3 remote task reference")
-        wan3_options = {"on_task_created": record_wan3_task} if params.video_source == "wan3" else {}
+        wan3_options = {
+            "on_task_created": record_wan3_task,
+            "on_clip_completed": lambda done, total: _report_task_details(
+                task_id, clips_completed=done, clips_total=total,
+            ),
+        } if params.video_source == "wan3" else {}
         try:
             downloaded_videos = material.download_videos(
                 task_id=task_id,
@@ -1098,6 +1112,7 @@ def generate_final_videos(
             utils.task_dir(task_id), f"combined-{index}.mp4"
         )
         logger.info(f"\n\n## combining video: {index} => {combined_video_path}")
+        _report_task_details(task_id, stage="combine")
         used_video_paths = []
         batch_options = (
             {
@@ -1150,7 +1165,7 @@ def generate_final_videos(
                 })
 
         _progress += 50 / params.video_count / 2
-        sm.state.update_task(task_id, progress=_progress)
+        sm.state.update_task(task_id, progress=_progress, stage="render")
 
         final_video_path = path.join(utils.task_dir(task_id), f"final-{index}.mp4")
 
@@ -1604,7 +1619,8 @@ def _run_pipeline(
 ):
     logger.info(f"start task: {task_id}, stop_at: {stop_at}")
     sm.state.update_task(
-        task_id, state=const.TASK_STATE_PROCESSING, progress=5,
+        task_id, state=const.TASK_STATE_PROCESSING, progress=5, stage="script",
+        clips_completed=None, clips_total=None,
         failed_stage=None, error=None,
         videos=[], combined_videos=[], warnings=None, failed_video_index=None,
     )
@@ -1774,7 +1790,7 @@ def _run_pipeline(
         )
         return _mark_task_failed(task_id, "script", error)
 
-    sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=10)
+    sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=10, stage="terms")
 
     if stop_at == "script":
         sm.state.update_task(
@@ -1808,7 +1824,7 @@ def _run_pipeline(
         )
         return {"script": video_script, "terms": video_terms}
 
-    sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=20)
+    sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=20, stage="audio")
 
     # 3. Generate audio
     generate_audio_kwargs = {
@@ -1852,7 +1868,7 @@ def _run_pipeline(
             "failed to prepare narration audio",
         )
 
-    sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=30)
+    sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=30, stage="subtitles")
 
     if stop_at == "audio":
         # Full video jobs apply gain in the final mixer. Audio-only exports have
@@ -1916,7 +1932,7 @@ def _run_pipeline(
         )
         return {"subtitle_path": subtitle_path}
 
-    sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=40)
+    sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=40, stage="materials")
 
     if defer_wan3_prompts and not use_storyboard_timing:
         amount = max(1, math.ceil(audio_duration * params.video_count
@@ -1969,7 +1985,7 @@ def _run_pipeline(
         )
         return {"materials": downloaded_videos}
 
-    sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=50)
+    sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=50, stage="combine")
 
     # 仅完整视频生成流程才需要处理视频拼接模式；
     # 这样可以避免 /subtitle 和 /audio 这类请求访问不存在的字段。
