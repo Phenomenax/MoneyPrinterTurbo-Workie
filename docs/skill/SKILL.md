@@ -55,3 +55,7 @@ Deliver only files from this run with the existing chat file tool. If successful
 Missing configuration (exit 10): `MPT_NEEDS_INPUT` lists `MISSING` fields. Request only these settings together, keep secrets out of chat, and rerun after configuration is supplied. Other explicit material sources retain their own credentials and charge-confirmation requirements.
 
 Failure (exit 1): report `MPT_ERROR` and the relevant log location. Read only the needed log tail. Repair a recoverable local problem before retrying; a remote task or download failure must not trigger blind resubmission of a paid generation task.
+
+For explicit Infistar video generation, use `MPT_INFISTAR_VIDEO_API_KEY` (separate from the Infistar LLM key). When `INFISTAR_CHARGE_CONFIRMATION_REQUIRED` is reported, explain the per-task charge and add `--confirm-infistar-charge` only after the user confirms.
+
+For explicit Jalapeno Cloud video generation, use `MPT_JALAPENO_VIDEO_API_KEY`; an empty video key reuses the configured Jalapeno Cloud LLM key. When `JALAPENO_CHARGE_CONFIRMATION_REQUIRED` is reported, explain the per-task charge and add `--confirm-jalapeno-charge` only after the user confirms.
