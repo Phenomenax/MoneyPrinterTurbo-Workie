@@ -842,26 +842,28 @@ def get_video_materials(
         # 顺序匹配模式只在用户显式开启时生效。这里强制素材下载按关键词顺序
         # 轮询，避免某个早期关键词下载太多素材，把后续脚本主题挤出最终时间线。
         wan3_task_ids = []
+        wan3_task_lock = threading.Lock()
         def record_wan3_task(remote_task_id):
-            if remote_task_id not in wan3_task_ids:
-                wan3_task_ids.append(remote_task_id)
-            reference_saved = False
-            try:
-                material._save_wan3_task_id(task_id, remote_task_id)
-                reference_saved = True
-            except Exception as exc:
-                logger.warning(f"could not save Wan3 task ledger: {type(exc).__name__}")
-            try:
-                reference = {"wan3_task_id": remote_task_id, "wan3_task_ids": list(wan3_task_ids)}
-                if not sm.state.patch_task(task_id, **reference):
-                    sm.state.update_task(task_id, **reference)
-            except Exception as exc:
-                logger.warning(f"could not update Wan3 task state: {type(exc).__name__}")
-            script_saved = task_artifacts.patch_script_data(
-                task_id, wan3_task_id=remote_task_id, wan3_task_ids=list(wan3_task_ids)
-            )
-            if not reference_saved and not script_saved:
-                raise RuntimeError("could not persist the Wan3 remote task reference")
+            with wan3_task_lock:
+                if remote_task_id not in wan3_task_ids:
+                    wan3_task_ids.append(remote_task_id)
+                reference_saved = False
+                try:
+                    material._save_wan3_task_id(task_id, remote_task_id)
+                    reference_saved = True
+                except Exception as exc:
+                    logger.warning(f"could not save Wan3 task ledger: {type(exc).__name__}")
+                try:
+                    reference = {"wan3_task_id": remote_task_id, "wan3_task_ids": list(wan3_task_ids)}
+                    if not sm.state.patch_task(task_id, **reference):
+                        sm.state.update_task(task_id, **reference)
+                except Exception as exc:
+                    logger.warning(f"could not update Wan3 task state: {type(exc).__name__}")
+                script_saved = task_artifacts.patch_script_data(
+                    task_id, wan3_task_id=remote_task_id, wan3_task_ids=list(wan3_task_ids)
+                )
+                if not reference_saved and not script_saved:
+                    raise RuntimeError("could not persist the Wan3 remote task reference")
         wan3_options = {
             "on_task_created": record_wan3_task,
             "on_clip_completed": lambda done, total: _report_task_details(

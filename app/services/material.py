@@ -1,5 +1,6 @@
 import base64
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextvars import copy_context
 import io
 import json
 import math
@@ -33,12 +34,14 @@ from app.services import (
     video,
     volcengine_seedance,
     wan3,
+    wan3_coordinator,
 )
 from app.utils import logging_utils, utils
 
 # Thread-safe counter for API key rotation
 _api_key_counter = 0
 _api_key_lock = threading.Lock()
+_wan3_task_ids_lock = threading.Lock()
 
 # A provider URL can point to an unexpectedly large object or never-ending stream.
 # Short stock and generated clips should stay well below this conservative cap.
@@ -2756,6 +2759,11 @@ def _download_videos_ofox_on_demand(
 
 def _save_wan3_task_id(local_task_id: str, remote_task_id: str) -> None:
     """Persist recovery IDs for standalone material calls without a task callback."""
+    with _wan3_task_ids_lock:
+        _save_wan3_task_id_locked(local_task_id, remote_task_id)
+
+
+def _save_wan3_task_id_locked(local_task_id: str, remote_task_id: str) -> None:
     target = Path(utils.task_dir(local_task_id)) / "wan3-tasks.json"
     task_ids = []
     if target.exists():
@@ -2763,7 +2771,7 @@ def _save_wan3_task_id(local_task_id: str, remote_task_id: str) -> None:
         task_ids = data["task_ids"]
         if not isinstance(task_ids, list):
             raise ValueError("Wan3 recovery record task_ids must be a list")
-    task_ids = [*task_ids, remote_task_id]
+    task_ids = list(dict.fromkeys([*task_ids, remote_task_id]))
     temp_path = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -2792,6 +2800,7 @@ def _generate_wan3_materials(
     video_aspect: VideoAspect,
     material_directory: str,
     on_task_created: Callable[[str], None] | None,
+    stop_event=None,
 ) -> Iterator[tuple[str, float, dict[str, Any], str]]:
     """Share submission, recovery IDs, download and media probing across callers."""
     def record_task(remote_task_id: str) -> None:
@@ -2805,6 +2814,7 @@ def _generate_wan3_materials(
         minimum_duration=request_seconds,
         video_aspect=video_aspect,
         on_task_created=record_task,
+        stop_event=stop_event,
     )
     if not items:
         raise wan3.Wan3Error("Wan3 returned no material for a visual prompt")
@@ -2837,6 +2847,130 @@ def _report_wan3_count(callback, completed: int, total: int) -> None:
             logger.warning(f"Wan3 count callback failed: error={type(exc).__name__}")
 
 
+def _schedule_wan3(*, task_id, requests, video_aspect, material_directory,
+                   on_task_created, progress_callback, on_clip_completed,
+                   required_duration=0, max_clip_duration=0):
+    """A bounded sliding window shared by both Wan3 material entry points."""
+    # Config/aspect and every prompt/duration must be validated before workers
+    # can start a paid request. Entry points validate their mode-specific fields.
+    wan3.validate_config()
+    try:
+        VideoAspect(video_aspect)
+    except (TypeError, ValueError) as exc:
+        raise wan3.Wan3Error("Wan3 video aspect is invalid") from exc
+    stop = threading.Event()
+    error_lock, callback_lock = threading.Lock(), threading.Lock()
+    errors = []
+    results = [None] * len(requests)
+
+    def fail(exc):
+        with error_lock:
+            if not errors:
+                errors.append(exc)
+            stop.set()
+
+    def record_task(remote_id):
+        # Includes the user's complete read/modify/write callback, not just append.
+        with callback_lock:
+            if on_task_created is not None:
+                on_task_created(remote_id)
+            else:
+                _save_wan3_task_id(task_id, remote_id)
+
+    def run(index):
+        prompt, seconds, plan = requests[index]
+        try:
+            wan3_coordinator.check_stopped(stop)
+            items = list(_generate_wan3_materials(
+                task_id=task_id, prompt=prompt, request_seconds=seconds,
+                video_aspect=video_aspect, material_directory=material_directory,
+                on_task_created=record_task, stop_event=stop,
+            ))
+            if not items:
+                raise wan3.Wan3Error("Wan3 returned no material for a visual prompt")
+            if plan is not None:
+                items = items[:1]
+                _, duration, record, remote_id = items[0]
+                required = float(getattr(plan, "required_source_seconds", 0) or 0)
+                playback = float(getattr(plan, "target_playback_seconds", 0) or 0)
+                shortfall = _STORYBOARD_FRAME_SECONDS * (required / playback if playback > 0 else 1.0)
+                if duration + shortfall + 1e-4 < required:
+                    raise wan3.Wan3Error(
+                        f"shot {plan.index} Wan3 material is too short: "
+                        f"available={duration:.3f}s, required={required:.3f}s. "
+                        "No additional paid generation was submitted.", task_id=remote_id,
+                    )
+                record["storyboard_shot"] = plan.index
+            return items
+        except wan3_coordinator.SubmissionStopped:
+            raise
+        except Exception as exc:
+            if plan is not None and isinstance(exc, wan3.Wan3Error):
+                exc = type(exc)(f"storyboard shot {plan.index}: {exc}", task_id=exc.task_id)
+            fail(exc)
+            raise exc
+
+    completed, total_duration, next_index = 0, 0.0, 0
+    _report_wan3_count(on_clip_completed, 0, len(requests))
+    workers = min(wan3.get_concurrency(), len(requests))
+    with ThreadPoolExecutor(max_workers=workers,
+                            thread_name_prefix="wan3-material") as executor:
+        pending = {}
+
+        def fill_window():
+            nonlocal next_index
+            while not stop.is_set() and next_index < len(requests) and len(pending) < workers:
+                index = next_index
+                next_index += 1
+                pending[executor.submit(copy_context().run, logging_utils.bind_log_scope(run), index)] = index
+
+        fill_window()
+        while pending:
+            done, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in done:
+                index = pending.pop(future)
+                plan = requests[index][2]
+                try:
+                    items = future.result()
+                except wan3_coordinator.SubmissionStopped:
+                    continue
+                except Exception as exc:
+                    if plan is not None and isinstance(exc, wan3.Wan3Error):
+                        plan.remote_task_id = exc.task_id or None
+                    continue  # The worker already saved the first actual error.
+                results[index] = items
+                if plan is not None:
+                    saved_path, duration, _, remote_id = items[0]
+                    plan.remote_task_id = remote_id or None
+                    plan.material_seconds, plan.material_path = duration, saved_path
+                try:
+                    _persist_material_sources(task_id, [item[2] for result in results if result for item in result])
+                except Exception as exc:
+                    fail(exc)
+                completed += 1
+                total_duration += sum(min(max_clip_duration, item[1]) for item in items) if required_duration else 0
+                fraction = min(total_duration / required_duration, 1.0) if required_duration else completed / len(requests)
+                if progress_callback is not None:
+                    try:
+                        progress_callback(fraction)
+                    except Exception as exc:
+                        logger.warning(f"Wan3 progress callback failed: error={type(exc).__name__}")
+                _report_wan3_count(on_clip_completed, completed, len(requests))
+            fill_window()
+    if errors:
+        raise errors[0]
+    if required_duration and total_duration + 0.001 < required_duration:
+        raise wan3.Wan3Error(
+            "Wan3 ordered materials do not cover the narration after actual-duration validation: "
+            f"available={total_duration:.2f}s, required={required_duration:.2f}s; "
+            "no additional paid task was submitted"
+        )
+    paths = [item[0] for result in results if result for item in result]
+    mode = "ordered" if required_duration else "storyboard"
+    logger.success(f"generated and downloaded {len(paths)} {mode} Wan3 videos")
+    return paths
+
+
 def _download_storyboard_wan3(
     *,
     task_id: str,
@@ -2862,57 +2996,22 @@ def _download_storyboard_wan3(
             )
         if not prompt:
             raise wan3.Wan3Error(f"shot {shot_index} is missing a visual prompt")
+        try:
+            timing = [float(getattr(plan, field, 0) or 0) for field in (
+                "required_source_seconds", "target_playback_seconds",
+            )]
+            if any(not math.isfinite(value) or value < 0 for value in timing):
+                raise ValueError("invalid timing")
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise wan3.Wan3Error(f"shot {shot_index} has invalid material timing") from exc
 
-    paths: List[str] = []
-    sources: list[dict[str, Any]] = []
-    _report_wan3_count(on_clip_completed, 0, len(plans))
-    try:
-        for offset, plan in enumerate(plans, start=1):
-            try:
-                saved_path, duration, record, remote_task_id = next(_generate_wan3_materials(
-                    task_id=task_id,
-                    prompt=str(plan.prompt).strip(),
-                    request_seconds=int(plan.request_seconds),
-                    video_aspect=video_aspect,
-                    material_directory=material_directory,
-                    on_task_created=on_task_created,
-                ))
-            except wan3.Wan3Error as exc:
-                plan.remote_task_id = exc.task_id or None
-                raise type(exc)(f"storyboard shot {plan.index}: {exc}", task_id=exc.task_id) from exc
-            if remote_task_id and hasattr(plan, "remote_task_id"):
-                plan.remote_task_id = remote_task_id
-            if hasattr(plan, "material_seconds"):
-                plan.material_seconds = duration
-            if hasattr(plan, "material_path"):
-                plan.material_path = saved_path
-            required = float(getattr(plan, "required_source_seconds", 0) or 0)
-            playback = float(getattr(plan, "target_playback_seconds", 0) or 0)
-            allowed_shortfall = _STORYBOARD_FRAME_SECONDS * (
-                required / playback if playback > 0 else 1.0
-            )
-            if duration + allowed_shortfall + 1e-4 < required:
-                raise wan3.Wan3Error(
-                    f"shot {plan.index} Wan3 material is too short: "
-                    f"available={duration:.3f}s, required={required:.3f}s. "
-                    "No additional paid generation was submitted.",
-                    task_id=remote_task_id,
-                )
-            paths.append(saved_path)
-            record["storyboard_shot"] = plan.index
-            sources.append(record)
-            if progress_callback is not None:
-                try:
-                    progress_callback(offset / len(plans))
-                except Exception as exc:
-                    logger.warning(f"Wan3 progress callback failed: error={type(exc).__name__}")
-            _persist_material_sources(task_id, sources)
-            _report_wan3_count(on_clip_completed, offset, len(plans))
-    except Exception:
-        _persist_material_sources(task_id, sources)
-        raise
-    logger.success(f"generated and downloaded {len(paths)} storyboard Wan3 videos")
-    return paths
+    return _schedule_wan3(
+        task_id=task_id,
+        requests=[(str(plan.prompt).strip(), plan.request_seconds, plan) for plan in plans],
+        video_aspect=video_aspect, material_directory=material_directory,
+        on_task_created=on_task_created, progress_callback=progress_callback,
+        on_clip_completed=on_clip_completed,
+    )
 
 
 def _download_videos_wan3_on_demand(
@@ -2947,41 +3046,13 @@ def _download_videos_wan3_on_demand(
             f"prompts={len(search_terms)}, clip={max_clip_duration}s, required={required_duration:.2f}s"
         )
 
-    paths: List[str] = []
-    sources: list[dict[str, Any]] = []
-    total_duration = 0.0
-    _report_wan3_count(on_clip_completed, 0, len(search_terms))
-    try:
-        for offset, term in enumerate(search_terms, start=1):
-            for saved_path, duration, record, _remote_task_id in _generate_wan3_materials(
-                task_id=task_id,
-                prompt=term,
-                request_seconds=max_clip_duration,
-                video_aspect=video_aspect,
-                material_directory=material_directory,
-                on_task_created=on_task_created,
-            ):
-                paths.append(saved_path)
-                sources.append(record)
-                total_duration += min(max_clip_duration, duration)
-                if progress_callback is not None:
-                    try:
-                        progress_callback(min(total_duration / required_duration, 1.0))
-                    except Exception as exc:
-                        logger.warning(f"Wan3 progress callback failed: error={type(exc).__name__}")
-                _persist_material_sources(task_id, sources)
-            _report_wan3_count(on_clip_completed, offset, len(search_terms))
-        if total_duration + 0.001 < required_duration:
-            raise wan3.Wan3Error(
-                "Wan3 ordered materials do not cover the narration after actual-duration validation: "
-                f"available={total_duration:.2f}s, required={required_duration:.2f}s; "
-                "no additional paid task was submitted"
-            )
-    except Exception:
-        _persist_material_sources(task_id, sources)
-        raise
-    logger.success(f"generated and downloaded {len(paths)} ordered Wan3 videos")
-    return paths
+    return _schedule_wan3(
+        task_id=task_id, requests=[(term, max_clip_duration, None) for term in search_terms],
+        video_aspect=video_aspect, material_directory=material_directory,
+        on_task_created=on_task_created, progress_callback=progress_callback,
+        on_clip_completed=on_clip_completed,
+        required_duration=required_duration, max_clip_duration=max_clip_duration,
+    )
 
 
 def _download_videos_muapi_on_demand(

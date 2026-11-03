@@ -96,6 +96,8 @@ wan3_model_name = "wan3.0-video"
 wan3_resolution = "1080P"
 wan3_poll_interval = 15
 wan3_run_timeout = 1200
+# 同一 runtime root 的所有进程共享最多 5 个远端任务；1 可恢复串行调度。见 docs/wan3-concurrency.md。
+wan3_concurrency = 5
 
 # API key lists support key rotation. Use straight ASCII double quotes and
 # separate multiple keys with commas, for example: ["key-1", "key-2"].

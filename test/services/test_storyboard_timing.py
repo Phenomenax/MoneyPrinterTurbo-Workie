@@ -437,6 +437,15 @@ class StoryboardTimingTests(unittest.TestCase):
 
 
 class StoryboardMaterialTests(unittest.TestCase):
+    def setUp(self):
+        # These regressions assert the original serial failure/order semantics.
+        settings = patch.dict(material.config.app, {"wan3_concurrency": 1})
+        settings.start()
+        self.addCleanup(settings.stop)
+        validation = patch.object(material.wan3, "validate_config")
+        validation.start()
+        self.addCleanup(validation.stop)
+
     def _plan(self, index: int, request: int, required: float, playback: float):
         shot = _shot(index, playback)
         shot.request_seconds = request
@@ -550,7 +559,7 @@ class StoryboardMaterialTests(unittest.TestCase):
             (None, [5, 5]),
             ([self._plan(1, 6, 6.0, 6.0), self._plan(2, 3, 3.0, 3.0)], [6, 3]),
         ):
-            with self.subTest(per_shot=plans is not None), tempfile.TemporaryDirectory() as tmp:
+            with self.subTest(per_shot=plans is not None), tempfile.TemporaryDirectory():
                 with patch.object(material.wan3, "generate_videos", side_effect=[
                     [self._item("remote-1")], [self._item("remote-2")],
                 ]) as generate, patch.object(

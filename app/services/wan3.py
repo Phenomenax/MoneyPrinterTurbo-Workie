@@ -14,6 +14,7 @@ from loguru import logger
 
 from app.config import config
 from app.models.schema import MaterialInfo, VideoAspect
+from app.services import wan3_coordinator as coordinator
 from app.utils.request_logging import trace_http_call
 
 
@@ -40,6 +41,17 @@ class Wan3UnconfirmedTaskError(Wan3Error):
 
 class Wan3DownloadError(Wan3Error):
     """A paid output could not be downloaded or validated locally."""
+
+
+def get_concurrency() -> int:
+    value = config.app.get("wan3_concurrency", 5)
+    if isinstance(value, bool):
+        return 5
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError, OverflowError):
+        return 5
+    return min(parsed, 5) if parsed >= 1 else 5
 
 
 def get_api_key(settings: Mapping[str, Any] | None = None) -> str:
@@ -156,6 +168,7 @@ def generate_videos(
     video_aspect: VideoAspect = VideoAspect.portrait,
     *,
     on_task_created: Callable[[str], None] | None = None,
+    stop_event=None,
 ) -> list[MaterialInfo]:
     """Submit one silent clip, save its remote ID, then poll the same task."""
     validate_config()
@@ -191,12 +204,37 @@ def generate_videos(
         },
     }
     try:
-        response = trace_http_call(
-            "POST", requests.post,
-            f"{base_url}/api/v1/services/aigc/video-generation/video-synthesis",
-            headers=headers, json=payload, proxies=config.proxy,
-            verify=_tls_verify(), timeout=(30, 60), allow_redirects=False,
+        slot = coordinator.acquire_slot(
+            base_url=base_url,
+            probe=lambda remote_id: _probe_terminal(remote_id, base_url, headers),
+            stop_event=stop_event,
         )
+    except coordinator.CoordinationError as exc:
+        raise Wan3UnconfirmedTaskError(str(exc)) from exc
+    try:
+        return _submit_and_wait(slot, payload, base_url, headers, api_key,
+                                minimum_duration, term, on_task_created, stop_event)
+    finally:
+        # Uncertainty and known running IDs stay on disk after the owner exits.
+        try:
+            if slot.record.get("phase") == "reserved":
+                slot.complete()
+        finally:
+            slot.close()
+
+
+def _submit_and_wait(slot, payload, base_url, headers, api_key,
+                     minimum_duration, term, on_task_created, stop_event):
+    try:
+        with slot.submission(stop_event):
+            response = trace_http_call(
+                "POST", requests.post,
+                f"{base_url}/api/v1/services/aigc/video-generation/video-synthesis",
+                headers=headers, json=payload, proxies=config.proxy,
+                verify=_tls_verify(), timeout=(30, 60), allow_redirects=False,
+            )
+    except coordinator.SubmissionStopped:
+        raise
     except Exception as exc:
         raise Wan3UnconfirmedTaskError(
             "Wan3 submission returned no response; a paid task may exist remotely: "
@@ -212,8 +250,11 @@ def generate_videos(
         body = response.json()
     except Exception as exc:
         error_type = Wan3UnconfirmedTaskError if 200 <= status < 300 else Wan3Error
+        if error_type is Wan3Error:
+            slot.complete()
         raise error_type(f"Wan3 submission returned unreadable JSON: HTTP {status}") from exc
     if not 200 <= status < 300:
+        slot.complete()
         raise Wan3Error(f"Wan3 submission rejected: HTTP {status}, {_response_error(body, api_key)}")
     output = body.get("output") if isinstance(body, dict) else None
     task_id = str(output.get("task_id") or "").strip() if isinstance(output, dict) else ""
@@ -221,6 +262,12 @@ def generate_videos(
         raise Wan3UnconfirmedTaskError(
             "Wan3 accepted the submission without returning a task ID"
         )
+    try:
+        slot.save("submitted", task_id=task_id)
+    except Exception as exc:
+        raise Wan3UnconfirmedTaskError(
+            f"Wan3 coordination record could not be saved: id={task_id}", task_id=task_id,
+        ) from exc
     logger.info(f"Wan3 video task created: id={task_id}")
     if on_task_created is not None:
         try:
@@ -231,7 +278,8 @@ def generate_videos(
                 task_id=task_id,
             ) from exc
 
-    task = _wait_for_task(task_id=task_id, base_url=base_url, headers=headers, api_key=api_key)
+    task = _wait_for_task(task_id=task_id, base_url=base_url, headers=headers,
+                          api_key=api_key, on_terminal=slot.complete)
     video_url = task["output"].get("video_url")
     try:
         parsed = urlsplit(video_url) if isinstance(video_url, str) else None
@@ -257,7 +305,29 @@ def generate_videos(
     )]
 
 
-def _wait_for_task(*, task_id: str, base_url: str, headers: dict[str, str], api_key: str) -> dict[str, Any]:
+def _probe_terminal(task_id, base_url, headers):
+    """Read-only recovery of an orphan; never resubmit or assume a timeout ended it."""
+    response = trace_http_call(
+        "GET", requests.get, f"{base_url}/api/v1/tasks/{quote(task_id, safe='')}",
+        headers=headers, proxies=config.proxy, verify=_tls_verify(),
+        timeout=(10, 10), allow_redirects=False,
+    )
+    if not 200 <= _status_code(response) < 300:
+        raise Wan3UnconfirmedTaskError(f"Wan3 recovery status unknown: id={task_id}", task_id=task_id)
+    body = response.json()
+    output = body.get("output") if isinstance(body, dict) else None
+    status = str(output.get("task_status") or "").strip().upper() if isinstance(output, dict) else ""
+    if status in coordinator.TERMINAL_STATES:
+        return True
+    if status in {"PENDING", "RUNNING"}:
+        return False
+    raise Wan3UnconfirmedTaskError(
+        f"Wan3 recovery returned an unknown task status: id={task_id}", task_id=task_id,
+    )
+
+
+def _wait_for_task(*, task_id: str, base_url: str, headers: dict[str, str], api_key: str,
+                   on_terminal=None) -> dict[str, Any]:
     deadline = time.monotonic() + _bounded_float("wan3_run_timeout", DEFAULT_RUN_TIMEOUT_SECONDS, 1.0, 7200.0)
     interval = _bounded_float("wan3_poll_interval", DEFAULT_POLL_INTERVAL_SECONDS, 0.5, 60.0)
     task_url = f"{base_url}/api/v1/tasks/{quote(task_id, safe='')}"
@@ -299,6 +369,8 @@ def _wait_for_task(*, task_id: str, base_url: str, headers: dict[str, str], api_
             continue
         failures = 0
         status = str(output.get("task_status") or "").strip().upper()
+        if status in coordinator.TERMINAL_STATES and on_terminal is not None:
+            on_terminal()
         if status == "SUCCEEDED":
             return body
         if status in {"FAILED", "CANCELED", "CANCELLED"}:

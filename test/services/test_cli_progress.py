@@ -149,6 +149,8 @@ def test_task_failure_preserves_progress_in_state_and_return_value(monkeypatch):
 
 @pytest.mark.parametrize("storyboard", [False, True])
 def test_wan3_counts_only_validated_downloads_and_preserves_partial_count(monkeypatch, storyboard):
+    monkeypatch.setitem(material.config.app, "wan3_concurrency", 1)
+    monkeypatch.setattr(material.wan3, "validate_config", lambda: None)
     calls, counts = [], []
     def generate(**kwargs):
         calls.append(kwargs["prompt"])
@@ -173,6 +175,8 @@ def test_wan3_counts_only_validated_downloads_and_preserves_partial_count(monkey
 
 
 def test_short_storyboard_clip_is_not_counted_and_callback_errors_are_ignored(monkeypatch):
+    monkeypatch.setitem(material.config.app, "wan3_concurrency", 1)
+    monkeypatch.setattr(material.wan3, "validate_config", lambda: None)
     monkeypatch.setattr(material, "_generate_wan3_materials", lambda **_k: iter([("clip", 1, {}, "remote")]))
     monkeypatch.setattr(material, "_persist_material_sources", lambda *_a: None)
     counts = []

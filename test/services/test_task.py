@@ -847,6 +847,7 @@ class TestTaskService(unittest.TestCase):
         要求 LLM 生成有序关键词，并适当增加关键词数量以覆盖更多脚本片段。
         """
         params = VideoParams(
+            video_source="pexels",
             video_subject="城市通勤",
             video_script="",
             match_materials_to_script=True,
@@ -873,6 +874,7 @@ class TestTaskService(unittest.TestCase):
         却又在任务编排层把空列表转换成其它真值后继续执行外部请求。
         """
         params = VideoParams(
+            video_source="pexels",
             video_subject="startup story",
             video_script="A short startup story.",
         )
