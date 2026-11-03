@@ -45,9 +45,12 @@ _CLI_VIDEO_SOURCES = (
     "wavespeed",
     "volcengine_seedance",
     "ofox",
+    "infistar",
+    "jalapeno",
     "metaso_minimax",
     "muapi",
     "openai_image",
+    "codex_image",
     "local",
 )
 
@@ -393,6 +396,14 @@ Batch manifests:
             "confirm that Volcano Engine Seedance creates paid Ark tasks; required "
             "with --video-source volcengine_seedance for materials or video output"
         ),
+    )
+    material_group.add_argument(
+        "--confirm-jalapeno-charge", action="store_true",
+        help="confirm paid Jalapeno Cloud video generation for materials or video output",
+    )
+    material_group.add_argument(
+        "--confirm-infistar-charge", action="store_true",
+        help="confirm paid Infistar video generation for materials or video output",
     )
     material_group.add_argument(
         "--confirm-ofox-charge",
@@ -832,6 +843,13 @@ Batch manifests:
             "--confirm-muapi-charge is required with --video-source muapi"
         )
 
+    if (not args.batch_file and args.video_source == "infistar"
+            and stage_requires_materials and not args.confirm_infistar_charge):
+        parser.error("--confirm-infistar-charge is required with --video-source infistar")
+    if (not args.batch_file and args.video_source == "jalapeno"
+            and stage_requires_materials and not args.confirm_jalapeno_charge):
+        parser.error("--confirm-jalapeno-charge is required with --video-source jalapeno")
+
     if args.bgm_file:
         if args.bgm_type in (None, "custom"):
             args.bgm_type = "custom"
@@ -1235,6 +1253,8 @@ def _validate_batch_task_params(
     ofox_charge_confirmed: bool,
     metaso_minimax_charge_confirmed: bool,
     muapi_charge_confirmed: bool,
+    infistar_charge_confirmed: bool = False,
+    jalapeno_charge_confirmed: bool = False,
 ) -> None:
     if not params.video_subject.strip() and not params.video_script.strip():
         raise ValueError("one of video_subject or video_script is required")
@@ -1303,6 +1323,13 @@ def _validate_batch_task_params(
         and not muapi_charge_confirmed
     ):
         raise ValueError("--confirm-muapi-charge is required for MuAPI video generation")
+
+    if (params.video_source == "infistar" and stop_at in {"materials", "video"}
+            and not infistar_charge_confirmed):
+        raise ValueError("--confirm-infistar-charge is required for Infistar video generation")
+    if (params.video_source == "jalapeno" and stop_at in {"materials", "video"}
+            and not jalapeno_charge_confirmed):
+        raise ValueError("--confirm-jalapeno-charge is required for Jalapeno Cloud video generation")
 
     if stop_at == "subtitle" and not params.subtitle_enabled:
         raise ValueError("stop_at=subtitle cannot be combined with disabled subtitles")
@@ -1417,6 +1444,8 @@ def _build_batch_tasks(args: argparse.Namespace) -> list[VideoParams]:
                     args.confirm_metaso_minimax_charge
                 ),
                 muapi_charge_confirmed=args.confirm_muapi_charge,
+                infistar_charge_confirmed=args.confirm_infistar_charge,
+                jalapeno_charge_confirmed=args.confirm_jalapeno_charge,
             )
         except (TypeError, ValueError) as exc:
             raise ValueError(f"invalid batch task {index}: {exc}") from exc
@@ -1850,26 +1879,8 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
-def _force_utf8_console() -> None:
-    """Make stdout/stderr UTF-8 before anything is printed.
-
-    Windows consoles default to a legacy code page (cp1252 in Western
-    Europe). Generating a French video produces U+202F, the narrow no-break
-    space French typography puts before ':' and '!', and Loguru's own progress
-    lines carry circled digits. Either one raises UnicodeEncodeError, which
-    kills the process *after* the video was written successfully -- so the run
-    reports failure and never prints where the file is.
-    """
-    for stream in (sys.stdout, sys.stderr):
-        reconfigure = getattr(stream, "reconfigure", None)
-        if reconfigure is None:
-            continue
-        try:
-            reconfigure(encoding="utf-8", errors="replace")
-        except (ValueError, OSError):
-            continue
-
-
 if __name__ == "__main__":
-    _force_utf8_console()
+    from app.utils.logging_utils import force_utf8_console
+
+    force_utf8_console()
     raise SystemExit(run_cli())
