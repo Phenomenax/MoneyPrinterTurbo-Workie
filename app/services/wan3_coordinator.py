@@ -132,13 +132,17 @@ class Slot:
             if stop_event is not None and stop_event.is_set():
                 self.complete()  # Known not to have entered POST yet.
                 check_stopped(stop_event)
-            # The durable start timestamp and the lock held through POST already
-            # space submissions. Do not let advisory bookkeeping after POST hide
-            # an accepted response before its paid task ID can be recorded.
+            # Space the next start from this POST's return too: filesystem and
+            # connection scheduling must not shorten the gateway's observed gap.
+            # Failure of this advisory write must not hide an accepted task ID.
             yield
+            try:
+                atomic_json(target, time.time())
+            except OSError:
+                pass
 
 
-def _read_record(target):
+def _read_record(target, label="Wan3"):
     try:
         record = json.loads(target.read_text()) if target.exists() else None
         if record is not None and (
@@ -146,15 +150,24 @@ def _read_record(target):
             or record.get("phase") not in {"reserved", "submitting", "submitted"}
             or not isinstance(record.get("task_id"), str)
             or not isinstance(record.get("base_url"), str)
+            or not isinstance(record.get("identity", ""), str)
         ):
             raise ValueError("invalid slot record")
         return record
     except (ValueError, OSError) as exc:
-        raise CoordinationError(f"Wan3 record requires verification: {target}") from exc
+        raise CoordinationError(f"{label} record requires verification: {target}") from exc
 
 
-def acquire_slot(*, base_url: str, probe, stop_event: threading.Event | None = None) -> Slot:
-    root = paths.runtime_root() / ".agent-logs" / "wan3"
+def acquire_slot(*, base_url: str, probe, stop_event: threading.Event | None = None,
+                 namespace: str = "wan3", identity: str | None = None,
+                 label: str = "Wan3") -> Slot:
+    """Reserve one of the shared slots under ``namespace``.
+
+    With ``identity`` (an internal credential fingerprint), a record is only
+    probed when it was written by the same provider, endpoint and key; any other
+    record stays reserved. Records without identity keep the Wan3 base-URL rule.
+    """
+    root = paths.runtime_root() / ".agent-logs" / namespace
     root.mkdir(parents=True, exist_ok=True)
     while True:
         check_stopped(stop_event)
@@ -166,10 +179,12 @@ def acquire_slot(*, base_url: str, probe, stop_event: threading.Event | None = N
             try:
                 if not owner.acquire():
                     continue
-                record = _read_record(slot.target)
+                record = _read_record(slot.target, label)
                 if record and record.get("phase") != "reserved":
                     remote_id = record.get("task_id")
-                    if not remote_id or record.get("base_url") != base_url:
+                    recorded_identity = record.get("identity")
+                    if (not remote_id or record.get("base_url") != base_url
+                            or (identity is not None and recorded_identity != identity)):
                         unresolved.append(f"{slot.target}: submission requires verification")
                         continue
                     try:
@@ -180,14 +195,15 @@ def acquire_slot(*, base_url: str, probe, stop_event: threading.Event | None = N
                     if not terminal:
                         continue
                 check_stopped(stop_event)
-                slot.save("reserved", base_url=base_url, pid=os.getpid(), task_id="")
+                fields = {"identity": identity} if identity is not None else {}
+                slot.save("reserved", base_url=base_url, pid=os.getpid(), task_id="", **fields)
                 keep = True
                 return slot
             finally:
                 if not keep:
                     slot.close()
         if unresolved:
-            raise CoordinationError("Wan3 capacity cannot be safely reclaimed; " + "; ".join(unresolved))
+            raise CoordinationError(f"{label} capacity cannot be safely reclaimed; " + "; ".join(unresolved))
         if stop_event is None:
             time.sleep(0.5)
         else:

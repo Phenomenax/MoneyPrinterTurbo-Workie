@@ -769,6 +769,7 @@ def get_video_materials(
     shot_plan: list | None = None,
     jalapeno_video_endpoint: volcengine_seedance.SeedanceEndpoint | None = None,
     codex_image_context: codex_image.CodexImageContext | None = None,
+    video_run_config=None,
 ):
     if params.video_source == "local":
         logger.info("\n\n## preprocess local materials")
@@ -887,6 +888,33 @@ def get_video_materials(
                 task_id, clips_completed=done, clips_total=total,
             ),
         } if params.video_source == "wan3" else {}
+        seedance_task_ids = []
+
+        def record_seedance_task(remote_task_id):
+            # material writes the authoritative ledger first; state is auxiliary.
+            with wan3_task_lock:
+                if remote_task_id not in seedance_task_ids:
+                    seedance_task_ids.append(remote_task_id)
+                reference = {
+                    "volcengine_seedance_task_id": remote_task_id,
+                    "volcengine_seedance_task_ids": list(seedance_task_ids),
+                }
+                try:
+                    if not sm.state.patch_task(task_id, **reference):
+                        sm.state.update_task(task_id, **reference)
+                except Exception as exc:
+                    logger.warning(f"could not update Seedance task state: {type(exc).__name__}")
+                task_artifacts.patch_script_data(task_id, **reference)
+
+        if params.video_source == "volcengine_seedance" and video_run_config is not None:
+            wan3_options = {
+                "on_task_created": record_seedance_task,
+                "on_clip_completed": lambda done, total: _report_task_details(
+                    task_id, clips_completed=done, clips_total=total,
+                ),
+            }
+        if video_run_config is not None:
+            generation_options["video_run_config"] = video_run_config
         try:
             downloaded_videos = material.download_videos(
                 task_id=task_id,
@@ -936,6 +964,10 @@ def get_video_materials(
                 if remote_task_id
                 else None
             )
+            if seedance_task_ids or (remote_task_id and video_run_config is not None
+                                     and params.video_source == "volcengine_seedance"):
+                known = list(dict.fromkeys([*seedance_task_ids, *([remote_task_id] if remote_task_id else [])]))
+                details = {**(details or {}), "volcengine_seedance_task_ids": known}
             _mark_task_failed(
                 task_id,
                 "materials",
@@ -1651,6 +1683,7 @@ def _run_pipeline(
     codex_image_context: codex_image.CodexImageContext | None = None,
     storyboard_data=None,
     storyboard_clip_duration: int | None = None,
+    video_run_config=None,
 ):
     logger.info(f"start task: {task_id}, stop_at: {stop_at}")
     sm.state.update_task(
@@ -1662,6 +1695,11 @@ def _run_pipeline(
     )
 
     generation_progress.stage("preparing")
+    if video_run_config is not None and video_run_config.source != params.video_source:
+        return _mark_task_failed(
+            task_id, "preflight",
+            "the environment video configuration does not match the selected video source",
+        )
     use_storyboard_timing = storyboard_data is not None
     storyboard_options = {}
     if use_storyboard_timing:
@@ -1669,7 +1707,10 @@ def _run_pipeline(
             return _mark_task_failed(task_id, "preflight", "storyboard has no timed shots")
         if stop_at in {"materials", "video"}:
             try:
-                storyboard_options = material.storyboard_generation_options(params.video_source)
+                storyboard_options = material.storyboard_generation_options(
+                    params.video_source,
+                    **({"video_run_config": video_run_config} if video_run_config is not None else {}),
+                )
             except ValueError as exc:
                 return _mark_task_failed(task_id, "preflight", str(exc))
 
@@ -1688,13 +1729,15 @@ def _run_pipeline(
         try:
             if not wan3.MIN_CLIP_SECONDS <= params.video_clip_duration <= wan3.MAX_CLIP_SECONDS:
                 raise wan3.Wan3Error("Wan3 clip duration must be an integer from 2 to 30 seconds")
-            wan3.validate_config()
+            if video_run_config is None:
+                wan3.validate_config()
         except wan3.Wan3Error as exc:
             return _mark_task_failed(task_id, "preflight", str(exc))
 
     if (
         stop_at in {"materials", "video"}
         and params.video_source == "volcengine_seedance"
+        and video_run_config is None
         and not volcengine_seedance.is_enabled()
     ):
         return _mark_task_failed(
@@ -2044,6 +2087,7 @@ def _run_pipeline(
            if codex_image_context is not None else {}),
         **({"jalapeno_video_endpoint": jalapeno_video_endpoint}
            if jalapeno_video_endpoint is not None else {}),
+        **({"video_run_config": video_run_config} if video_run_config is not None else {}),
     )
     if use_storyboard_timing and storyboard_timeline is not None:
         task_artifacts.patch_script_data(task_id, **storyboard_timeline.script_updates())
@@ -2181,12 +2225,14 @@ def start(
     codex_image_context: codex_image.CodexImageContext | None = None,
     storyboard_data=None,
     storyboard_clip_duration: int | None = None,
+    video_run_config=None,
 ):
     """
     执行任务流水线，并确保未预期异常也会转换成可查询的失败状态。
 
     ``allow_server_file_input`` 只供本机 CLI 使用。HTTP API 和 WebUI 必须保持
-    默认值，让自定义音频始终受当前任务目录约束。
+    默认值，让自定义音频始终受当前任务目录约束。``video_run_config`` 是 CLI
+    从固定环境建立的视频供应商配置，整次任务只使用这一份。
     """
     with generation_progress.task_scope(task_id):
         try:
@@ -2206,6 +2252,7 @@ def start(
                    if codex_image_context is not None else {}),
                 **({"jalapeno_video_endpoint": jalapeno_video_endpoint}
                    if jalapeno_video_endpoint is not None else {}),
+                **({"video_run_config": video_run_config} if video_run_config is not None else {}),
             )
         except Exception as exc:
             logger.exception(

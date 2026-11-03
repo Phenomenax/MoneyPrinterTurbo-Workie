@@ -591,7 +591,9 @@ class StoryboardMaterialTests(unittest.TestCase):
 
     def test_task_start_appends_storyboard_arguments(self):
         parameters = list(inspect.signature(tm.start).parameters)
-        self.assertEqual(parameters[-2:], ["storyboard_data", "storyboard_clip_duration"])
+        self.assertEqual(
+            parameters[-3:], ["storyboard_data", "storyboard_clip_duration", "video_run_config"]
+        )
 
 
 class StoryboardPipelineTests(unittest.TestCase):

@@ -16,6 +16,16 @@ from app.services import material, task as tm
 from app.services.state import MemoryState
 
 
+@pytest.mark.parametrize("phase", [[], {}, None, 1, True])
+def test_malformed_activity_cannot_prevent_progress_export(tmp_path, phase):
+    state = MemoryState()
+    state.update_task("task", stage="materials", progress=45, generation_activity={"phase": phase})
+    reporter = TaskProgress(tmp_path / "progress.json", "task", state)
+    reporter._write()
+    snapshot = json.loads(reporter.path.read_text())
+    assert snapshot["percent"] == 45 and snapshot["generation_activity"] is None
+
+
 def test_cli_exports_live_state_and_joins_before_final_snapshot(tmp_path, monkeypatch, capsys):
     state = MemoryState()
     monkeypatch.setattr(tm.sm, "state", state)
@@ -84,6 +94,31 @@ def test_unwritable_progress_and_state_outage_do_not_escape(tmp_path, monkeypatc
     reporter = TaskProgress(tmp_path / "new.json", "task", state)
     reporter.start()
     reporter.finish(False)
+
+
+def test_generation_activity_exports_only_whitelisted_display_fields(tmp_path):
+    state = MemoryState()
+    target = tmp_path / "progress.json"
+    state.update_task("task", progress=45, stage="materials", generation_activity={
+        "phase": "checking", "provider": "volcengine_seedance", "remote_id": "cgt-1",
+        "retrying": True, "confirmed_at": 1.5, "downloaded_bytes": 10, "total_bytes": 20,
+        "remote_status": "running", "started_at": 1, "url": "https://x.invalid/?token=secret",
+    })
+    TaskProgress(target, "task", state)._write()
+    assert json.loads(target.read_text())["generation_activity"] == {
+        "phase": "checking", "provider": "volcengine_seedance", "remote_id": "cgt-1",
+        "retrying": True, "confirmed_at": 1.5, "downloaded_bytes": 10, "total_bytes": 20,
+    }
+    for activity, expected in [
+        ({"phase": "preparing"}, None),
+        ("not a dict", None),
+        ({"phase": "downloading", "remote_id": "https://evil.invalid/?k=1", "downloaded_bytes": -1,
+          "total_bytes": True, "retrying": "yes", "confirmed_at": float("nan")}, {"phase": "downloading"}),
+    ]:
+        state.update_task("task", generation_activity=activity)
+        TaskProgress(target, "task", state)._write()
+        assert json.loads(target.read_text())["generation_activity"] == expected
+    assert "secret" not in target.read_text()
 
 
 def test_progress_option_rejects_batch():

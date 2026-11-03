@@ -14,6 +14,7 @@ from loguru import logger
 
 from app.config import config
 from app.models.schema import MaterialInfo, VideoAspect
+from app.services import generation_progress
 from app.services import wan3_coordinator as coordinator
 from app.utils.request_logging import trace_http_call
 
@@ -43,7 +44,9 @@ class Wan3DownloadError(Wan3Error):
     """A paid output could not be downloaded or validated locally."""
 
 
-def get_concurrency() -> int:
+def get_concurrency(run_config=None) -> int:
+    if run_config is not None:
+        return run_config.concurrency
     value = config.app.get("wan3_concurrency", 5)
     if isinstance(value, bool):
         return 5
@@ -118,11 +121,17 @@ def _resolution(settings: Mapping[str, Any] | None = None) -> str:
     return value
 
 
-def _tls_verify() -> bool:
+def _tls_verify(run_config=None) -> bool:
+    if run_config is not None:
+        return True if run_config.tls_verify is None else run_config.tls_verify
     value = config.app.get("tls_verify", True)
     if isinstance(value, str):
         return value.strip().lower() not in {"0", "false", "no", "off", ""}
     return bool(value)
+
+
+def _proxies(run_config=None):
+    return config.proxy if run_config is None else run_config.proxy_map() or {}
 
 
 def _bounded_float(name: str, default: float, minimum: float, maximum: float) -> float:
@@ -133,9 +142,9 @@ def _bounded_float(name: str, default: float, minimum: float, maximum: float) ->
     return min(max(value, minimum), maximum) if math.isfinite(value) else default
 
 
-def _redact(value: Any, api_key: str) -> str:
+def _redact(value: Any, api_key: str, run_config=None) -> str:
     text = str(value or "")
-    for secret in [api_key, *config.proxy.values()]:
+    for secret in [api_key, *_proxies(run_config).values()]:
         if secret:
             text = text.replace(str(secret), "***")
             text = text.replace(quote_plus(str(secret)), "***")
@@ -149,7 +158,7 @@ def _status_code(response: Any) -> int:
         return 0
 
 
-def _response_error(body: Any, api_key: str) -> str:
+def _response_error(body: Any, api_key: str, run_config=None) -> str:
     if not isinstance(body, dict):
         return "unreadable provider response"
     output = body.get("output")
@@ -158,7 +167,7 @@ def _response_error(body: Any, api_key: str) -> str:
         ": ".join(str(value) for value in (
             output.get("code") or body.get("code"),
             output.get("message") or body.get("message"),
-        ) if value), api_key,
+        ) if value), api_key, run_config,
     ) or "provider did not return error details"
 
 
@@ -169,9 +178,15 @@ def generate_videos(
     *,
     on_task_created: Callable[[str], None] | None = None,
     stop_event=None,
+    run_config=None,
 ) -> list[MaterialInfo]:
-    """Submit one silent clip, save its remote ID, then poll the same task."""
-    validate_config()
+    """Submit one silent clip, save its remote ID, then poll the same task.
+
+    ``run_config`` is the task's frozen environment selection; when present,
+    neither environment variables nor ``config.app`` are read again.
+    """
+    if run_config is None:
+        validate_config()
     term = str(search_term or "").strip()
     if not term:
         raise Wan3Error("Wan3 visual prompt must not be empty")
@@ -186,18 +201,22 @@ def generate_videos(
     ):
         raise Wan3Error("Wan3 clip duration must be an integer from 2 to 30 seconds")
 
-    api_key = get_api_key()
-    base_url = _base_url()
+    if run_config is None:
+        api_key, base_url = get_api_key(), _base_url()
+        model, resolution = _setting("wan3_model_name", DEFAULT_MODEL_NAME), _resolution()
+    else:
+        api_key, base_url = run_config.api_key, run_config.endpoint
+        model, resolution = run_config.model, run_config.resolution
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
         "X-DashScope-Async": "enable",
     }
     payload = {
-        "model": _setting("wan3_model_name", DEFAULT_MODEL_NAME),
+        "model": model,
         "input": {"prompt": term},
         "parameters": {
-            "resolution": _resolution(),
+            "resolution": resolution,
             "ratio": aspect.value,
             "duration": minimum_duration,
             "audio": False,
@@ -206,14 +225,15 @@ def generate_videos(
     try:
         slot = coordinator.acquire_slot(
             base_url=base_url,
-            probe=lambda remote_id: _probe_terminal(remote_id, base_url, headers),
+            probe=lambda remote_id: _probe_terminal(remote_id, base_url, headers, run_config),
             stop_event=stop_event,
         )
     except coordinator.CoordinationError as exc:
         raise Wan3UnconfirmedTaskError(str(exc)) from exc
     try:
         return _submit_and_wait(slot, payload, base_url, headers, api_key,
-                                minimum_duration, term, on_task_created, stop_event)
+                                minimum_duration, term, on_task_created, stop_event,
+                                run_config)
     finally:
         # Uncertainty and known running IDs stay on disk after the owner exits.
         try:
@@ -224,21 +244,22 @@ def generate_videos(
 
 
 def _submit_and_wait(slot, payload, base_url, headers, api_key,
-                     minimum_duration, term, on_task_created, stop_event):
+                     minimum_duration, term, on_task_created, stop_event, run_config=None):
+    generation_progress.submitting("wan3")
     try:
         with slot.submission(stop_event):
             response = trace_http_call(
                 "POST", requests.post,
                 f"{base_url}/api/v1/services/aigc/video-generation/video-synthesis",
-                headers=headers, json=payload, proxies=config.proxy,
-                verify=_tls_verify(), timeout=(30, 60), allow_redirects=False,
+                headers=headers, json=payload, proxies=_proxies(run_config),
+                verify=_tls_verify(run_config), timeout=(30, 60), allow_redirects=False,
             )
     except coordinator.SubmissionStopped:
         raise
     except Exception as exc:
         raise Wan3UnconfirmedTaskError(
             "Wan3 submission returned no response; a paid task may exist remotely: "
-            f"error={type(exc).__name__}, detail={_redact(exc, api_key)}"
+            f"error={type(exc).__name__}, detail={_redact(exc, api_key, run_config)}"
         ) from exc
 
     status = _status_code(response)
@@ -255,7 +276,9 @@ def _submit_and_wait(slot, payload, base_url, headers, api_key,
         raise error_type(f"Wan3 submission returned unreadable JSON: HTTP {status}") from exc
     if not 200 <= status < 300:
         slot.complete()
-        raise Wan3Error(f"Wan3 submission rejected: HTTP {status}, {_response_error(body, api_key)}")
+        raise Wan3Error(
+            f"Wan3 submission rejected: HTTP {status}, {_response_error(body, api_key, run_config)}"
+        )
     output = body.get("output") if isinstance(body, dict) else None
     task_id = str(output.get("task_id") or "").strip() if isinstance(output, dict) else ""
     if not task_id:
@@ -279,7 +302,7 @@ def _submit_and_wait(slot, payload, base_url, headers, api_key,
             ) from exc
 
     task = _wait_for_task(task_id=task_id, base_url=base_url, headers=headers,
-                          api_key=api_key, on_terminal=slot.complete)
+                          api_key=api_key, on_terminal=slot.complete, run_config=run_config)
     video_url = task["output"].get("video_url")
     try:
         parsed = urlsplit(video_url) if isinstance(video_url, str) else None
@@ -305,11 +328,11 @@ def _submit_and_wait(slot, payload, base_url, headers, api_key,
     )]
 
 
-def _probe_terminal(task_id, base_url, headers):
+def _probe_terminal(task_id, base_url, headers, run_config=None):
     """Read-only recovery of an orphan; never resubmit or assume a timeout ended it."""
     response = trace_http_call(
         "GET", requests.get, f"{base_url}/api/v1/tasks/{quote(task_id, safe='')}",
-        headers=headers, proxies=config.proxy, verify=_tls_verify(),
+        headers=headers, proxies=_proxies(run_config), verify=_tls_verify(run_config),
         timeout=(10, 10), allow_redirects=False,
     )
     if not 200 <= _status_code(response) < 300:
@@ -327,11 +350,19 @@ def _probe_terminal(task_id, base_url, headers):
 
 
 def _wait_for_task(*, task_id: str, base_url: str, headers: dict[str, str], api_key: str,
-                   on_terminal=None) -> dict[str, Any]:
-    deadline = time.monotonic() + _bounded_float("wan3_run_timeout", DEFAULT_RUN_TIMEOUT_SECONDS, 1.0, 7200.0)
-    interval = _bounded_float("wan3_poll_interval", DEFAULT_POLL_INTERVAL_SECONDS, 0.5, 60.0)
+                   on_terminal=None, run_config=None) -> dict[str, Any]:
+    if run_config is not None:
+        run_timeout = run_config.run_timeout if run_config.run_timeout is not None else DEFAULT_RUN_TIMEOUT_SECONDS
+    else:
+        run_timeout = _bounded_float("wan3_run_timeout", DEFAULT_RUN_TIMEOUT_SECONDS, 1.0, 7200.0)
+    if run_config is not None:
+        interval = run_config.poll_interval if run_config.poll_interval is not None else DEFAULT_POLL_INTERVAL_SECONDS
+    else:
+        interval = _bounded_float("wan3_poll_interval", DEFAULT_POLL_INTERVAL_SECONDS, 0.5, 60.0)
+    deadline = time.monotonic() + run_timeout
     task_url = f"{base_url}/api/v1/tasks/{quote(task_id, safe='')}"
     failures = 0
+    generation_progress.remote("wan3", task_id)
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -340,7 +371,7 @@ def _wait_for_task(*, task_id: str, base_url: str, headers: dict[str, str], api_
         try:
             response = trace_http_call(
                 "GET", requests.get, task_url, headers=headers,
-                proxies=config.proxy, verify=_tls_verify(),
+                proxies=_proxies(run_config), verify=_tls_verify(run_config),
                 timeout=(phase_timeout, phase_timeout), allow_redirects=False,
             )
             status_code = _status_code(response)
@@ -362,19 +393,21 @@ def _wait_for_task(*, task_id: str, base_url: str, headers: dict[str, str], api_
             remaining = deadline - time.monotonic()
             if not retryable or failures > MAX_POLL_RETRIES or remaining <= 0:
                 raise Wan3UnconfirmedTaskError(
-                    f"Wan3 polling failed; remote task may still be running: id={task_id}, error={type(exc).__name__}, detail={_redact(exc, api_key)}",
+                    f"Wan3 polling failed; remote task may still be running: id={task_id}, error={type(exc).__name__}, detail={_redact(exc, api_key, run_config)}",
                     task_id=task_id,
                 ) from exc
+            generation_progress.remote("wan3", task_id, retrying=True)
             time.sleep(min(float(failures), remaining))
             continue
         failures = 0
         status = str(output.get("task_status") or "").strip().upper()
+        generation_progress.remote("wan3", task_id, status)
         if status in coordinator.TERMINAL_STATES and on_terminal is not None:
             on_terminal()
         if status == "SUCCEEDED":
             return body
         if status in {"FAILED", "CANCELED", "CANCELLED"}:
-            raise Wan3Error(f"Wan3 task failed: id={task_id}, status={status}, {_response_error(body, api_key)}", task_id=task_id)
+            raise Wan3Error(f"Wan3 task failed: id={task_id}, status={status}, {_response_error(body, api_key, run_config)}", task_id=task_id)
         if status not in {"PENDING", "RUNNING"}:
             raise Wan3UnconfirmedTaskError(f"Wan3 returned an unknown task status: id={task_id}, status={status!r}", task_id=task_id)
         remaining = deadline - time.monotonic()

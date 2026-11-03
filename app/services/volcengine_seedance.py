@@ -1,9 +1,11 @@
+import hashlib
 import math
 import os
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Mapping
-from urllib.parse import quote_plus
+from urllib.parse import quote, quote_plus
 
 import requests
 from loguru import logger
@@ -12,6 +14,7 @@ from app.utils.request_logging import trace_http_call
 
 from app.config import config
 from app.services import generation_progress
+from app.services import wan3_coordinator as coordinator
 from app.models.schema import MaterialInfo, VideoAspect
 
 
@@ -31,6 +34,11 @@ TERMINAL_FAILURE_STATUSES = frozenset(
 )
 ACTIVE_STATUSES = frozenset({"queued", "running"})
 SUPPORTED_RESOLUTIONS = frozenset({"480p", "720p", "1080p"})
+# TokenHub wraps upstream 5xx failures as HTTP 422 with these codes or with an
+# ``InternalServerError`` type. Other 422 responses are specific rejections.
+UPSTREAM_FAULT_CODES = frozenset({"UpstreamTimeout", "UpstreamUnreachable", "InternalError"})
+UPSTREAM_FAULT_TYPE = "InternalServerError"
+COORDINATION_NAMESPACE = "seedance"
 
 
 @dataclass(frozen=True)
@@ -49,6 +57,37 @@ class SeedanceEndpoint:
     generate_audio: bool = False
     poll_interval: float = DEFAULT_POLL_INTERVAL_SECONDS
     run_timeout: float = DEFAULT_RUN_TIMEOUT_SECONDS
+    # Models without a native audio switch must not receive ``generate_audio``.
+    send_generate_audio: bool = True
+    # ``None`` keeps the process-wide network settings.
+    proxies: Mapping[str, str] | None = field(default=None, repr=False)
+    tls_verify: bool | None = None
+
+
+def endpoint_from_run_config(run_config) -> SeedanceEndpoint:
+    """Freeze a task's environment selection into the existing snapshot type."""
+    return SeedanceEndpoint(
+        provider_id="volcengine_seedance",
+        display_name=run_config.display_name,
+        api_key=run_config.api_key,
+        tasks_url=run_config.endpoint,
+        model=run_config.model,
+        resolution=run_config.resolution,
+        min_duration=run_config.min_duration,
+        max_duration=run_config.max_duration,
+        generate_audio=run_config.generate_audio,
+        send_generate_audio=run_config.send_generate_audio,
+        poll_interval=(
+            run_config.poll_interval if run_config.poll_interval is not None
+            else DEFAULT_POLL_INTERVAL_SECONDS
+        ),
+        run_timeout=(
+            run_config.run_timeout if run_config.run_timeout is not None
+            else DEFAULT_RUN_TIMEOUT_SECONDS
+        ),
+        proxies=run_config.proxy_map() or {},
+        tls_verify=True if run_config.tls_verify is None else run_config.tls_verify,
+    )
 
 
 class VolcEngineSeedanceError(RuntimeError):
@@ -158,8 +197,16 @@ def _duration_bounds() -> tuple[int, int]:
     return minimum, max(minimum, maximum)
 
 
-def _tls_verify() -> bool:
+def _tls_verify(endpoint: SeedanceEndpoint | None = None) -> bool:
+    if endpoint is not None and endpoint.tls_verify is not None:
+        return endpoint.tls_verify
     return _config_bool("tls_verify", True)
+
+
+def _proxies(endpoint: SeedanceEndpoint | None = None):
+    if endpoint is not None and endpoint.proxies is not None:
+        return dict(endpoint.proxies)
+    return config.proxy
 
 
 def _status_code(response: Any) -> int:
@@ -169,21 +216,53 @@ def _status_code(response: Any) -> int:
         return 200
 
 
-def _redact_secret(value: Any, secret: str) -> str:
+def _redact_secret(value: Any, secret: str, proxies: Mapping[str, Any] | None = None) -> str:
     text = str(value or "")
     if secret:
         text = text.replace(secret, "***")
         encoded = quote_plus(secret)
         if encoded != secret:
             text = text.replace(encoded, "***")
-    for proxy_url in config.proxy.values():
+    for proxy_url in (config.proxy if proxies is None else proxies).values():
         proxy_secret = str(proxy_url or "")
         if proxy_secret:
             text = text.replace(proxy_secret, "***")
     return text[:MAX_ERROR_TEXT_LENGTH]
 
 
-def _response_error(response: Any, api_key: str) -> str:
+def _error_fields(response: Any) -> tuple[str, str]:
+    """Return ``(code, type)``; platform rate limits use numeric codes."""
+    try:
+        payload = response.json()
+    except Exception:
+        return "", ""
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if not isinstance(error, dict):
+        return "", ""
+    code = error.get("code")
+    return (
+        "" if code is None or isinstance(code, bool) else str(code).strip(),
+        str(error.get("type") or "").strip(),
+    )
+
+
+def _is_upstream_fault(response: Any) -> bool:
+    if _status_code(response) != 422:
+        return False
+    code, error_type = _error_fields(response)
+    return code in UPSTREAM_FAULT_CODES or error_type == UPSTREAM_FAULT_TYPE
+
+
+def _rate_limit_reset(response: Any) -> float | None:
+    headers = getattr(response, "headers", None) or {}
+    try:
+        value = float(str(headers.get("x-ratelimit-reset", "")).strip())
+    except (TypeError, ValueError, AttributeError):
+        return None
+    return value if math.isfinite(value) and value >= 0 else None
+
+
+def _response_error(response: Any, api_key: str, proxies: Mapping[str, Any] | None = None) -> str:
     try:
         payload = response.json()
     except Exception:
@@ -198,7 +277,7 @@ def _response_error(response: Any, api_key: str) -> str:
         code = payload.get("code")
         message = payload.get("message") or error
     detail = ": ".join(str(item) for item in (code, message) if item not in (None, ""))
-    return _redact_secret(detail or f"HTTP {_status_code(response)}", api_key)
+    return _redact_secret(detail or f"HTTP {_status_code(response)}", api_key, proxies)
 
 
 def _is_retryable_error(error: Exception) -> bool:
@@ -212,7 +291,9 @@ def _is_retryable_error(error: Exception) -> bool:
     ):
         return True
     response = getattr(error, "response", None)
-    return response is not None and _status_code(response) in RETRYABLE_STATUS_CODES
+    return response is not None and (
+        _status_code(response) in RETRYABLE_STATUS_CODES or _is_upstream_fault(response)
+    )
 
 
 def _rendition_size(aspect: VideoAspect, resolution: str) -> tuple[int, int]:
@@ -227,6 +308,21 @@ def _rendition_size(aspect: VideoAspect, resolution: str) -> tuple[int, int]:
     if aspect == VideoAspect.square:
         return short_edge, short_edge
     return long_edge, short_edge
+
+
+def _video_payload(term: str, duration: int, aspect: VideoAspect, endpoint=None) -> dict:
+    payload = {
+        "model": endpoint.model if endpoint else _model_id(),
+        "content": [{"type": "text", "text": term}],
+        "ratio": aspect.value,
+        "duration": duration,
+        "resolution": endpoint.resolution if endpoint else _resolution(),
+        "watermark": endpoint.watermark
+        if endpoint else _config_bool("volcengine_seedance_watermark", False),
+    }
+    if endpoint and endpoint.send_generate_audio:
+        payload["generate_audio"] = endpoint.generate_audio
+    return payload
 
 
 def generate_videos(
@@ -273,19 +369,7 @@ def generate_videos(
             f"requested={requested_duration}s, using={duration}s "
             f"(configured {minimum}-{maximum}s)"
         )
-    resolution = endpoint.resolution if endpoint else _resolution()
-    payload = {
-        "model": endpoint.model if endpoint else _model_id(),
-        "content": [{"type": "text", "text": term}],
-        "ratio": aspect.value,
-        "duration": duration,
-        "resolution": resolution,
-        "watermark": endpoint.watermark
-        if endpoint else _config_bool("volcengine_seedance_watermark", False),
-    }
-    if endpoint:
-        # 新接入点明确关闭素材原声；成片仍由项目自己的配音与配乐流程处理。
-        payload["generate_audio"] = endpoint.generate_audio
+    payload = _video_payload(term, duration, aspect, endpoint)
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -302,39 +386,100 @@ def generate_videos(
     # 提交接口不做自动重试：超时或 5xx 可能发生在付费任务已经创建之后，
     # 盲目重试会造成重复扣费。只有拿到明确拒绝响应时才判定为确定性失败。
     generation_progress.submitting(provider_id)
+    task_id = _submitted_task_id(
+        _post_submission(tasks_url, payload, headers, api_key, endpoint),
+        api_key, endpoint,
+    )
+    logger.info(f"{display_name} task created: id={task_id}")
+
+    poll_options = (
+        {"run_timeout": endpoint.run_timeout, "poll_interval": endpoint.poll_interval}
+        if endpoint else {}
+    )
+    task = _wait_for_task(
+        task_id=task_id,
+        tasks_url=tasks_url,
+        headers=headers,
+        api_key=api_key,
+        endpoint=endpoint,
+        **poll_options,
+    )
+    if task is None:
+        return []
+    rendition = {"id": task_id}
+    if endpoint is None:
+        width, height = _rendition_size(aspect, payload["resolution"])
+        rendition.update(width=width, height=height)
+    return [_material(task, task_id, provider_id, term, duration, rendition)]
+
+
+def _material(task, task_id, provider_id, term, duration, rendition) -> MaterialInfo:
+    content = task.get("content")
+    video_url = content.get("video_url") if isinstance(content, dict) else None
+    if not isinstance(video_url, str) or not video_url.startswith(("http://", "https://")):
+        raise VolcEngineSeedanceError(
+            f"Seedance task succeeded without a downloadable video: id={task_id}",
+            task_id=task_id,
+        )
+    return MaterialInfo(
+        provider=provider_id,
+        url=video_url,
+        duration=duration,
+        source_info={
+            "provider": provider_id,
+            "search_term": term,
+            "asset_id": task_id,
+            "rendition": rendition,
+        },
+    )
+
+
+def _post_submission(tasks_url, payload, headers, api_key, endpoint):
     try:
-        response = trace_http_call(
+        return trace_http_call(
             "POST", requests.post,
             tasks_url,
             json=payload,
             headers=headers,
-            proxies=config.proxy,
-            verify=_tls_verify(),
+            proxies=_proxies(endpoint),
+            verify=_tls_verify(endpoint),
             timeout=(30, 60),
+            # A redirect could forward the bearer token to another host.
             allow_redirects=False,
         )
     except Exception as exc:
+        proxies = endpoint.proxies if endpoint else None
         raise VolcEngineSeedanceUnconfirmedTaskError(
             "Seedance submission returned no response; a paid task may already "
             "exist remotely: "
-            f"error={type(exc).__name__}, detail={_redact_secret(exc, api_key)}"
+            f"error={type(exc).__name__}, detail={_redact_secret(exc, api_key, proxies)}"
         ) from exc
 
+
+def _submitted_task_id(response, api_key: str, endpoint: SeedanceEndpoint | None) -> str:
+    """Return the remote ID; a plain error means the request was definitely refused."""
+    proxies = endpoint.proxies if endpoint else None
     status_code = _status_code(response)
     if 300 <= status_code < 400:
         raise VolcEngineSeedanceUnconfirmedTaskError(
             "Seedance submission returned a redirect; the paid task state is "
             "unknown and the request was not replayed"
         )
-    if status_code >= 500:
+    if status_code >= 500 or _is_upstream_fault(response):
         raise VolcEngineSeedanceUnconfirmedTaskError(
             f"Seedance submission failed with HTTP {status_code}; a paid task may "
-            "already exist remotely"
+            "already exist remotely: "
+            f"{_response_error(response, api_key, proxies)}"
         )
     if not 200 <= status_code < 300:
+        hint = (
+            " The account or gateway rate limit was reached; lower "
+            "MPT_SEEDANCE_CONCURRENCY or retry later."
+            if status_code == 429 else ""
+        )
         raise VolcEngineSeedanceError(
             "Seedance video generation request rejected: "
-            f"HTTP {status_code}, {_response_error(response, api_key)}"
+            f"HTTP {status_code}, {_response_error(response, api_key, proxies)}{hint}"
         )
     try:
         body = response.json()
@@ -348,46 +493,134 @@ def generate_videos(
         raise VolcEngineSeedanceUnconfirmedTaskError(
             "Seedance accepted the submission without returning a task id"
         )
-    logger.info(f"{display_name} task created: id={task_id}")
+    return task_id
 
-    poll_options = (
-        {"run_timeout": endpoint.run_timeout, "poll_interval": endpoint.poll_interval}
-        if endpoint else {}
-    )
-    task = _wait_for_task(
-        task_id=task_id,
-        tasks_url=tasks_url,
-        headers=headers,
-        api_key=api_key,
-        **poll_options,
-    )
-    if task is None:
-        return []
-    content = task.get("content")
-    video_url = content.get("video_url") if isinstance(content, dict) else None
-    if not isinstance(video_url, str) or not video_url.startswith(("http://", "https://")):
+
+def generate_coordinated_clip(
+    search_term: str,
+    duration: int,
+    video_aspect: VideoAspect,
+    *,
+    endpoint: SeedanceEndpoint,
+    identity: str,
+    on_task_created: Callable[[str], None] | None = None,
+    stop_event=None,
+) -> MaterialInfo:
+    """Generate one storyboard clip under the cross-process admission slots.
+
+    The duration is already validated against the model; it is never clamped.
+    Unknown submissions and unconfirmed remote states keep their slot.
+    """
+    term = str(search_term or "").strip()
+    if not term:
+        raise VolcEngineSeedanceError("Seedance visual prompt must not be empty")
+    aspect = VideoAspect(video_aspect)
+    if (isinstance(duration, bool) or not isinstance(duration, int)
+            or not endpoint.min_duration <= duration <= endpoint.max_duration):
         raise VolcEngineSeedanceError(
-            f"Seedance task succeeded without a downloadable video: id={task_id}",
+            f"Seedance clip duration must be an integer from {endpoint.min_duration} "
+            f"to {endpoint.max_duration} seconds"
+        )
+    payload = _video_payload(term, duration, aspect, endpoint)
+    headers = {
+        "Authorization": f"Bearer {endpoint.api_key}",
+        "Content-Type": "application/json",
+    }
+    namespace = f"{COORDINATION_NAMESPACE}-{_endpoint_namespace(endpoint.tasks_url)}"
+    try:
+        slot = coordinator.acquire_slot(
+            base_url=endpoint.tasks_url,
+            probe=lambda remote_id: _probe_terminal(remote_id, endpoint, headers),
+            stop_event=stop_event,
+            namespace=namespace,
+            identity=identity,
+            label="Seedance",
+        )
+    except coordinator.CoordinationError as exc:
+        raise VolcEngineSeedanceUnconfirmedTaskError(str(exc)) from exc
+    try:
+        logger.info(
+            f"generating video with {endpoint.display_name}: "
+            f"model={endpoint.model}, duration={duration}s"
+        )
+        generation_progress.submitting(endpoint.provider_id)
+        with slot.submission(stop_event):
+            response = _post_submission(
+                endpoint.tasks_url, payload, headers, endpoint.api_key, endpoint,
+            )
+        try:
+            task_id = _submitted_task_id(response, endpoint.api_key, endpoint)
+        except VolcEngineSeedanceUnconfirmedTaskError:
+            raise
+        except VolcEngineSeedanceError:
+            slot.complete()  # The gateway answered with an explicit refusal.
+            raise
+        try:
+            slot.save("submitted", task_id=task_id)
+        except Exception as exc:
+            raise VolcEngineSeedanceUnconfirmedTaskError(
+                f"Seedance admission record could not be saved: id={task_id}",
+                task_id=task_id,
+            ) from exc
+        logger.info(f"{endpoint.display_name} task created: id={task_id}")
+        if on_task_created is not None:
+            try:
+                on_task_created(task_id)
+            except Exception as exc:
+                raise VolcEngineSeedanceUnconfirmedTaskError(
+                    "Seedance task was submitted but its task ledger could not be "
+                    f"saved: id={task_id}",
+                    task_id=task_id,
+                ) from exc
+        task = _wait_for_task(
             task_id=task_id,
+            tasks_url=endpoint.tasks_url,
+            headers=headers,
+            api_key=endpoint.api_key,
+            run_timeout=endpoint.run_timeout,
+            poll_interval=endpoint.poll_interval,
+            endpoint=endpoint,
+            on_terminal=slot.complete,
         )
+        return _material(
+            task, task_id, endpoint.provider_id, term, duration, {"id": task_id},
+        )
+    finally:
+        try:
+            if slot.record.get("phase") == "reserved":
+                slot.complete()
+        finally:
+            slot.close()
 
-    rendition = {"id": task_id}
-    if endpoint is None:
-        width, height = _rendition_size(aspect, resolution)
-        rendition.update(width=width, height=height)
-    return [
-        MaterialInfo(
-            provider=provider_id,
-            url=video_url,
-            duration=duration,
-            source_info={
-                "provider": provider_id,
-                "search_term": term,
-                "asset_id": task_id,
-                "rendition": rendition,
-            },
+
+def _endpoint_namespace(tasks_url: str) -> str:
+    return hashlib.sha256(tasks_url.encode("utf-8")).hexdigest()[:16]
+
+
+def _probe_terminal(task_id: str, endpoint: SeedanceEndpoint, headers) -> bool:
+    """Read-only recovery query; never resubmits and never infers termination."""
+    response = trace_http_call(
+        "GET", requests.get,
+        f"{endpoint.tasks_url}/{quote(task_id, safe='')}",
+        headers=headers,
+        proxies=_proxies(endpoint),
+        verify=_tls_verify(endpoint),
+        timeout=(10, 10),
+        allow_redirects=False,
+    )
+    if not 200 <= _status_code(response) < 300:
+        raise VolcEngineSeedanceUnconfirmedTaskError(
+            f"Seedance recovery status unknown: id={task_id}", task_id=task_id,
         )
-    ]
+    body = response.json()
+    status = str(body.get("status") or "").strip().lower() if isinstance(body, dict) else ""
+    if status == "succeeded" or status in TERMINAL_FAILURE_STATUSES:
+        return True
+    if status in ACTIVE_STATUSES:
+        return False
+    raise VolcEngineSeedanceUnconfirmedTaskError(
+        f"Seedance recovery returned an unknown task status: id={task_id}", task_id=task_id,
+    )
 
 
 def _wait_for_task(
@@ -398,6 +631,8 @@ def _wait_for_task(
     api_key: str,
     run_timeout: float | None = None,
     poll_interval: float | None = None,
+    endpoint: SeedanceEndpoint | None = None,
+    on_terminal: Callable[[], None] | None = None,
 ) -> dict[str, Any] | None:
     deadline = time.monotonic() + (
         run_timeout if run_timeout is not None else _bounded_float(
@@ -415,7 +650,10 @@ def _wait_for_task(
             60.0,
         )
     )
-    generation_progress.remote('', task_id)
+    proxies = endpoint.proxies if endpoint else None
+    # No snapshot keeps the provider already published by ``submitting``.
+    provider = "" if endpoint is None else endpoint.provider_id
+    generation_progress.remote(provider, task_id)
     consecutive_failures = 0
     while True:
         remaining = deadline - time.monotonic()
@@ -433,22 +671,25 @@ def _wait_for_task(
         try:
             response = trace_http_call(
                 "GET", requests.get,
-                f"{tasks_url}/{task_id}",
+                f"{tasks_url}/{quote(task_id, safe='')}",
                 headers=headers,
-                proxies=config.proxy,
-                verify=_tls_verify(),
+                proxies=_proxies(endpoint),
+                verify=_tls_verify(endpoint),
                 timeout=(phase_timeout, phase_timeout),
                 allow_redirects=False,
             )
             status_code = _status_code(response)
-            if status_code in RETRYABLE_STATUS_CODES:
+            if status_code in RETRYABLE_STATUS_CODES or _is_upstream_fault(response):
                 raise requests.exceptions.HTTPError(
                     f"HTTP {status_code}", response=response
                 )
             if not 200 <= status_code < 300:
+                # Includes 404: the gateway cannot tell "never created" from
+                # "owned by another key" or "expired", so the slot stays held.
                 raise VolcEngineSeedanceUnconfirmedTaskError(
                     "Seedance task status is unknown: "
-                    f"http_status={status_code}, detail={_response_error(response, api_key)}",
+                    f"http_status={status_code}, "
+                    f"detail={_response_error(response, api_key, proxies)}",
                     task_id=task_id,
                 )
             body = response.json()
@@ -462,7 +703,8 @@ def _wait_for_task(
             if not _is_retryable_error(exc):
                 raise VolcEngineSeedanceUnconfirmedTaskError(
                     "Seedance polling failed and the paid task state is unknown: "
-                    f"error={type(exc).__name__}, detail={_redact_secret(exc, api_key)}",
+                    f"error={type(exc).__name__}, "
+                    f"detail={_redact_secret(exc, api_key, proxies)}",
                     task_id=task_id,
                 ) from exc
 
@@ -474,14 +716,23 @@ def _wait_for_task(
                     task_id=task_id,
                 ) from exc
             consecutive_failures += 1
-            generation_progress.remote('', task_id, retrying=True)
+            generation_progress.remote(provider, task_id, retrying=True)
             if consecutive_failures > MAX_POLL_RETRIES:
                 raise VolcEngineSeedanceUnconfirmedTaskError(
                     "Seedance polling failed after retries; the paid task may still "
                     f"be running remotely: id={task_id}",
                     task_id=task_id,
                 ) from exc
-            delay = min(RETRY_BASE_SECONDS * consecutive_failures, remaining)
+            failed_response = getattr(exc, "response", None)
+            reset = (
+                _rate_limit_reset(failed_response)
+                if failed_response is not None and _status_code(failed_response) == 429
+                else None
+            )
+            delay = min(
+                RETRY_BASE_SECONDS * consecutive_failures if reset is None else reset,
+                remaining,
+            )
             logger.warning(
                 "Seedance polling hit a transient error; retrying the same task: "
                 f"id={task_id}, attempt={consecutive_failures}/{MAX_POLL_RETRIES}, "
@@ -492,19 +743,22 @@ def _wait_for_task(
 
         consecutive_failures = 0
         status = str(body.get("status") or "").strip().lower()
-        generation_progress.remote('', task_id, status)
+        generation_progress.remote(provider, task_id, status)
+        if (status == "succeeded" or status in TERMINAL_FAILURE_STATUSES) and on_terminal:
+            on_terminal()
         if status == "succeeded":
             return body
         if status in TERMINAL_FAILURE_STATUSES:
             raise VolcEngineSeedanceError(
                 "Seedance task did not produce a video: "
                 f"id={task_id}, status={status}, "
-                f"detail={_redact_secret(body.get('error'), api_key)}",
+                f"detail={_redact_secret(body.get('error'), api_key, proxies)}",
                 task_id=task_id,
             )
         if status not in ACTIVE_STATUSES:
             raise VolcEngineSeedanceUnconfirmedTaskError(
-                f"Seedance returned an unknown task status: id={task_id}, status={status!r}",
+                f"Seedance returned an unknown task status: id={task_id}, "
+                f"status={_redact_secret(status, api_key, proxies)!r}",
                 task_id=task_id,
             )
         remaining = deadline - time.monotonic()

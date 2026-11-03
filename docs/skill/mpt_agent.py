@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import ast
+import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -22,10 +24,14 @@ from pathlib import Path
 
 
 PROJECT_ARCHIVE_URL = (
-    "https://github.com/harry0703/MoneyPrinterTurbo/archive/refs/heads/main.zip"
+    "https://github.com/Phenomenax/MoneyPrinterTurbo-Workie/archive/refs/heads/main.zip"
 )
 DEFAULT_ROOT = Path.home() / "MoneyPrinterTurbo"
-DEFAULT_VIDEO_SOURCE = "wan3"
+# Direct CLI still defaults to Wan3. This helper does not inject that default.
+ENV_VIDEO_SOURCES = ("wan3", "volcengine_seedance")
+VIDEO_RUN_CONFIG_PATH = Path("app") / "services" / "video_run_config.py"
+REQUIRED_VIDEO_RUN_CONFIG_API = 1
+VIDEO_CONFIG_OPTION = "--video-config-from-env"
 DEFAULT_VOICE_NAME = "zh-CN-XiaoxiaoNeural-Female"
 DEFAULT_UV_LOCK_TIMEOUT = "1200"
 NEEDS_INPUT_EXIT_CODE = 10
@@ -211,12 +217,14 @@ def ensure_project(root: Path) -> None:
     log("project download completed")
 
 
-def ensure_config(root: Path) -> Path:
+def ensure_config(root: Path, *, add_wan3_fields: bool = True) -> Path:
     """Create the initial configuration without overwriting an existing file."""
     config_path = root / "config.toml"
     if not config_path.exists():
         shutil.copy2(root / "config.example.toml", config_path)
         log(f"created configuration file: {config_path}")
+    if not add_wan3_fields:
+        return config_path
     text = config_path.read_text(encoding="utf-8")
     original = text
     for key, value in {
@@ -318,8 +326,12 @@ def _parse_string_list(value: str) -> list[str]:
     return list(dict.fromkeys(str(item).strip() for item in parsed if str(item).strip()))
 
 
-def apply_environment_config(config_path: Path) -> None:
-    """Write supplied credentials while logging field names only."""
+def apply_environment_config(config_path: Path, *, include_video: bool = True) -> None:
+    """Write supplied credentials while logging field names only.
+
+    Environment-selected video providers stay per run: with ``include_video``
+    false their keys, addresses and models are never written to config.toml.
+    """
     provider = os.environ.get("MPT_LLM_PROVIDER", "").strip().lower()
     if provider == "openai_compatible":
         provider = CUSTOM_OPENAI_PROVIDER
@@ -327,7 +339,9 @@ def apply_environment_config(config_path: Path) -> None:
     base_url = os.environ.get("MPT_LLM_BASE_URL", "").strip()
     model_name = os.environ.get("MPT_LLM_MODEL_NAME", "").strip()
     pexels_key = os.environ.get("MPT_PEXELS_API_KEY", "").strip()
-    seedance_key = os.environ.get("MPT_VOLCENGINE_ARK_API_KEY", "").strip()
+    seedance_key = (
+        os.environ.get("MPT_VOLCENGINE_ARK_API_KEY", "").strip() if include_video else ""
+    )
     ofox_key = os.environ.get("MPT_OFOX_API_KEY", "").strip()
     metaso_minimax_key = os.environ.get(
         "MPT_METASO_MINIMAX_API_KEY", ""
@@ -340,7 +354,7 @@ def apply_environment_config(config_path: Path) -> None:
         ),
         "wan3_base_url": os.environ.get("MPT_WAN3_BASE_URL", "").strip(),
         "wan3_model_name": os.environ.get("MPT_WAN3_MODEL_NAME", "").strip(),
-    }
+    } if include_video else {}
     infistar_video_key = os.environ.get("MPT_INFISTAR_VIDEO_API_KEY", "").strip()
     jalapeno_video_key = os.environ.get("MPT_JALAPENO_VIDEO_API_KEY", "").strip()
     if not any(
@@ -461,8 +475,8 @@ def reuse_existing_llm_provider(config_path: Path) -> str:
 
 
 def selected_video_source(cli_args: list[str]) -> str:
-    """Read the effective material source from forwarded CLI arguments."""
-    source = DEFAULT_VIDEO_SOURCE
+    """Read the explicit material source; empty means choose from the environment."""
+    source = ""
     for index, item in enumerate(cli_args):
         if item == "--video-source" and index + 1 < len(cli_args):
             source = cli_args[index + 1].strip().lower()
@@ -513,10 +527,46 @@ def needs_text_llm(cli_args: list[str]) -> bool:
     return not script or (selected_video_source(cli_args) != "local" and not terms)
 
 
-def verify_project_capabilities(root: Path, cli_args: list[str]) -> None:
-    """Inspect the CLI without importing app configuration or installing dependencies."""
-    if selected_video_source(cli_args) != "wan3" and not has_cli_option(cli_args, "--storyboard"):
-        return
+def uses_environment_video(cli_args: list[str]) -> bool:
+    return selected_video_source(cli_args) in ("", *ENV_VIDEO_SOURCES)
+
+
+def load_video_run_config(root: Path):
+    """Load the shared selection rules by path; the module uses only the stdlib."""
+    path = root / VIDEO_RUN_CONFIG_PATH
+    name = "_mpt_video_run_config_" + hashlib.sha256(str(path.resolve()).encode()).hexdigest()[:16]
+    module = sys.modules.get(name)
+    if module is None:
+        spec = importlib.util.spec_from_file_location(name, path)
+        if spec is None or spec.loader is None:
+            raise SkillError(f"cannot load {path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        try:
+            spec.loader.exec_module(module)
+        except Exception:
+            sys.modules.pop(name, None)
+            raise
+    version = getattr(module, "VIDEO_RUN_CONFIG_API_VERSION", None)
+    if type(version) is not int or version < REQUIRED_VIDEO_RUN_CONFIG_API:
+        raise SkillError(f"unsupported video configuration API in {path}")
+    return module
+
+
+def verify_project_capabilities(root: Path, cli_args: list[str]):
+    """Inspect the CLI and shared video module without installing dependencies.
+
+    Returns the loaded video configuration module when this run selects a
+    provider from environment variables.
+    """
+    environment_video = uses_environment_video(cli_args)
+    storyboard = has_cli_option(cli_args, "--storyboard")
+    if not environment_video and not storyboard:
+        return None
+    required = ["--storyboard"] if storyboard else []
+    if environment_video:
+        required.append(VIDEO_CONFIG_OPTION)
+    module = None
     try:
         tree = ast.parse((root / "cli.py").read_text(encoding="utf-8-sig"))
         sources = next(
@@ -532,15 +582,38 @@ def verify_project_capabilities(root: Path, cli_args: list[str]) -> None:
             and node.func.attr == "add_argument"
             for item in node.args if isinstance(item, ast.Constant)
         }
-        supported = "wan3" in sources and "--storyboard" in options
-    except (OSError, SyntaxError, ValueError, TypeError, StopIteration):
+        needed_sources = set(ENV_VIDEO_SOURCES) if environment_video else {selected_video_source(cli_args)}
+        supported = needed_sources <= set(sources) and set(required) <= options
+        if supported and environment_video:
+            module = load_video_run_config(root)
+    except (OSError, SyntaxError, ValueError, TypeError, StopIteration, ImportError, SkillError):
         supported = False
     if not supported:
+        needed = list(required)
+        if environment_video:
+            needed.append(f"{VIDEO_RUN_CONFIG_PATH.as_posix()} API {REQUIRED_VIDEO_RUN_CONFIG_API}")
         raise SkillError(
-            f"MoneyPrinterTurbo at {root} does not support wan3 and --storyboard. "
+            f"MoneyPrinterTurbo at {root} does not support the required capabilities "
+            f"({', '.join(needed)}). "
             "Upgrade that installation or use --root to select the updated checkout; "
             "the existing installation was not overwritten."
         )
+    return module
+
+
+def select_environment_video(module, environment: dict[str, str], cli_args: list[str]):
+    """Return ``(cli_args, child_env, None)`` or ``(cli_args, environment, input_required)``."""
+    resolved = module.resolve_video_run_config(environment, selected_video_source(cli_args) or None)
+    if isinstance(resolved, module.VideoInputRequired):
+        return cli_args, environment, resolved
+    result = [item for item in cli_args if item != VIDEO_CONFIG_OPTION]
+    if not has_cli_option(result, "--video-source"):
+        result = ["--video-source", resolved.source, *result]
+    result.append(VIDEO_CONFIG_OPTION)
+    if resolved.source == "volcengine_seedance" and not has_cli_option(result, "--confirm-seedance-charge"):
+        result.append("--confirm-seedance-charge")
+    log(f"video provider: {resolved.display_name}; model: {resolved.model}")
+    return result, resolved.child_environment(environment), None
 
 
 def missing_config(config_path: Path, cli_args: list[str]) -> tuple[str, list[str]]:
@@ -563,6 +636,9 @@ def missing_config(config_path: Path, cli_args: list[str]) -> tuple[str, list[st
                 missing.append(field)
 
     source = selected_video_source(cli_args)
+    if uses_environment_video(cli_args):
+        # Selected per run by the shared video configuration module.
+        return provider, missing
     if source not in SUPPORTED_SOURCES:
         raise SkillError(f"unsupported video source: {source}")
     if source == "local" and not has_cli_option(cli_args, "--video-materials"):
@@ -761,6 +837,19 @@ def report_missing_config(provider: str, missing: list[str]) -> int:
     return NEEDS_INPUT_EXIT_CODE
 
 
+def report_video_input(required) -> int:
+    """Ask for a provider or missing settings without printing secret values."""
+    print("MPT_NEEDS_INPUT")
+    for line in required.lines():
+        print(line)
+    print(
+        "Choose a listed provider or set the listed environment variables for "
+        "this helper process, then rerun the same storyboard. "
+        "Do not paste secrets into chat."
+    )
+    return NEEDS_INPUT_EXIT_CODE
+
+
 def report_invalid_pexels_config() -> int:
     """Request only a new Pexels key when every configured key is rejected."""
     print("MPT_NEEDS_INPUT")
@@ -914,6 +1003,7 @@ def generate_video(
     root: Path,
     subject: str,
     cli_args: list[str],
+    env: dict[str, str] | None = None,
 ) -> tuple[list[Path], Path, Path, Path]:
     """Run one traceable CLI task and return only its final video files."""
     uv = shutil.which("uv")
@@ -963,11 +1053,13 @@ def generate_video(
     ]
     log(f"starting video generation, task ID: {task_id}")
     log(f"full generation log: {log_path}")
+    child_env = os.environ.copy() if env is None else dict(env)
     try:
         with log_path.open("w", encoding="utf-8") as log_file:
             result = subprocess.run(
                 command,
                 cwd=root,
+                env=child_env,
                 stdout=subprocess.PIPE,
                 stderr=log_file,
                 text=True,
@@ -1065,23 +1157,52 @@ def generate_video(
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     cli_args = list(args.cli_args)
-    if not has_cli_option(cli_args, "--video-source"):
-        cli_args = ["--video-source", DEFAULT_VIDEO_SOURCE, *cli_args]
+    # Do not assume Wan3. Pass --video-source only after an explicit choice.
     if (
         not has_cli_option(cli_args, "--match-materials-to-script")
         and not has_cli_option(cli_args, "--no-match-materials-to-script")
     ):
         cli_args.append("--match-materials-to-script")
+    environment = os.environ.copy()
+    child_env = environment
     root = args.root.expanduser().resolve()
     stage = "input_paths"
     try:
         cli_args = prepare_storyboard(cli_args)
         stage = "project"
         ensure_project(root)
-        verify_project_capabilities(root, cli_args)
+        module = verify_project_capabilities(root, cli_args)
         stage = "configuration"
-        config_path = ensure_config(root)
-        apply_environment_config(config_path)
+        config_path = ensure_config(
+            root, add_wan3_fields=not uses_environment_video(cli_args),
+        )
+        if uses_environment_video(cli_args):
+            if module is None:
+                raise SkillError("video configuration module was not loaded")
+            cli_args, child_env, required = select_environment_video(
+                module, environment, cli_args,
+            )
+            if required is not None:
+                emit_feedback(
+                    "needs_input",
+                    "Video provider configuration is required",
+                    stage="configuration",
+                )
+                write_result_manifest(
+                    root,
+                    {
+                        "status": "needs_input",
+                        "subject": args.subject,
+                        "input_reason": required.reason,
+                        "missing": list(required.missing),
+                        "invalid": list(required.invalid),
+                        "options": list(required.options),
+                    },
+                )
+                return report_video_input(required)
+        apply_environment_config(
+            config_path, include_video=not uses_environment_video(cli_args),
+        )
         if needs_text_llm(cli_args):
             reuse_existing_llm_provider(config_path)
         provider, missing = missing_config(config_path, cli_args)
@@ -1109,7 +1230,7 @@ def main(argv: list[str] | None = None) -> int:
             return report_invalid_pexels_config()
         stage = "generation"
         videos, task_dir, log_path, result_path = generate_video(
-            root, args.subject, cli_args
+            root, args.subject, cli_args, env=child_env,
         )
     except Exception as exc:
         failure_stage = getattr(exc, "stage", None) or stage

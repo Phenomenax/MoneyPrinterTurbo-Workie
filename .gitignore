@@ -3,6 +3,7 @@
 /config.toml.bak
 /storage/
 /.agent-logs/wan3/
+/.agent-logs/seedance-*/
 /.idea/
 /app/services/__pycache__
 /app/__pycache__/

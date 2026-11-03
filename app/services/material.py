@@ -260,7 +260,7 @@ def _redact_secret(message: str, secret: str) -> str:
     return safe_message
 
 
-def _redact_request_error(error: Exception, *secrets: str) -> str:
+def _redact_request_error(error: Exception, *secrets: str, proxies=None) -> str:
     """
     保留网络异常的可排查信息，同时移除 API Key 和代理凭据。
 
@@ -270,7 +270,7 @@ def _redact_request_error(error: Exception, *secrets: str) -> str:
     safe_message = str(error)
     for secret in secrets:
         safe_message = _redact_secret(safe_message, str(secret or ""))
-    for proxy_url in config.proxy.values():
+    for proxy_url in (config.proxy if proxies is None else proxies).values():
         safe_message = _redact_secret(safe_message, str(proxy_url))
     return safe_message
 
@@ -1131,7 +1131,7 @@ def _wait_for_wavespeed_prediction(
 
 
 def _save_generated_video_with_retry(
-    video_url: str, save_dir: str, provider: str
+    video_url: str, save_dir: str, provider: str, *, network_options=None
 ) -> str:
     """
     下载已经付费生成的产物，失败时优先重试同一个地址。
@@ -1141,14 +1141,17 @@ def _save_generated_video_with_retry(
     """
     for attempt in range(WAVESPEED_MAX_DOWNLOAD_RETRIES + 1):
         try:
-            saved_video_path = save_video(video_url=video_url, save_dir=save_dir)
+            saved_video_path = save_video(
+                video_url=video_url, save_dir=save_dir, **(network_options or {}),
+            )
             if saved_video_path:
                 return saved_video_path
             failure_detail = "empty result"
         except Exception as e:
+            proxies = None if network_options is None else network_options.get("proxies") or {}
             failure_detail = (
                 f"error={type(e).__name__}, "
-                f"detail={_redact_request_error(e, video_url)}"
+                f"detail={_redact_request_error(e, video_url, proxies=proxies)}"
             )
         if attempt >= WAVESPEED_MAX_DOWNLOAD_RETRIES:
             break
@@ -1258,7 +1261,7 @@ def _is_valid_video_file(video_path: str) -> bool:
                 )
 
 
-def save_video(video_url: str, save_dir: str = "") -> str:
+def save_video(video_url: str, save_dir: str = "", *, proxies=None, tls_verify=None) -> str:
     generation_progress.downloading()
     if not save_dir:
         save_dir = utils.storage_dir("cache_videos")
@@ -1341,8 +1344,8 @@ def save_video(video_url: str, save_dir: str = "") -> str:
                 "GET", requests.get,
                 video_url,
                 headers=headers,
-                proxies=config.proxy,
-                verify=_get_tls_verify(),
+                proxies=config.proxy if proxies is None else proxies,
+                verify=_get_tls_verify() if tls_verify is None else tls_verify,
                 timeout=(60, 240),
                 stream=True,
             ) as response:
@@ -2362,7 +2365,7 @@ def _select_materials_until_duration(
     return selected
 
 
-def _storyboard_adapter(source: str):
+def _storyboard_adapter(source: str, video_run_config=None):
     adapters = {
         "wan3": (
             _download_storyboard_wan3,
@@ -2373,17 +2376,33 @@ def _storyboard_adapter(source: str):
             },
         ),
     }
+    # Seedance limits depend on the model family, which only the task's frozen
+    # environment selection identifies; the legacy global settings do not.
+    if (video_run_config is not None and source == "volcengine_seedance"
+            and video_run_config.source == source):
+        adapters[source] = (
+            _download_storyboard_seedance,
+            {
+                "minimum_clip_seconds": video_run_config.min_duration,
+                "maximum_clip_seconds": video_run_config.max_duration,
+                "provider_name": video_run_config.display_name,
+            },
+        )
     if source not in adapters:
+        detail = (
+            " without the environment video configuration (--video-config-from-env)"
+            if source == "volcengine_seedance" else ""
+        )
         raise ValueError(
-            f"video source {source!r} has no per-shot storyboard material adapter; "
+            f"video source {source!r} has no per-shot storyboard material adapter{detail}; "
             "the storyboard cannot use the whole-narration material path"
         )
     return adapters[source]
 
 
-def storyboard_generation_options(source: str) -> dict:
+def storyboard_generation_options(source: str, video_run_config=None) -> dict:
     """Resolve source limits before narration or paid video generation starts."""
-    return _storyboard_adapter(source)[1]
+    return _storyboard_adapter(source, video_run_config)[1]
 
 
 def download_videos(
@@ -2402,13 +2421,15 @@ def download_videos(
     on_clip_completed: Callable[[int, int], None] | None = None,
     jalapeno_video_endpoint: volcengine_seedance.SeedanceEndpoint | None = None,
     codex_image_context=None,
+    video_run_config=None,
 ) -> List[str]:
     """
     搜索并下载覆盖配音时长所需的素材，返回本地文件路径。
 
     ``progress_callback`` 可选：库存素材和 Wan3 在完成下载后报告比例。
-    ``on_clip_completed`` 仅供 Wan3 报告已通过校验的画面素材数量；
-    其他付费素材源保持现有行为。
+    ``on_clip_completed`` 供 Wan3 和分镜 Seedance 报告已通过校验的画面素材
+    数量；其他付费素材源保持现有行为。``video_run_config`` 是本任务冻结的
+    环境视频配置，传入后 Wan3/Seedance 不再读取全局配置。
     """
     source = source or "wan3"
     provider = "pexels"
@@ -2439,8 +2460,9 @@ def download_videos(
     elif material_directory and not os.path.isdir(material_directory):
         material_directory = ""
 
+    run_options = {"video_run_config": video_run_config} if video_run_config is not None else {}
     if shot_plan is not None:
-        download, _options = _storyboard_adapter(source)
+        download, _options = _storyboard_adapter(source, video_run_config)
         return download(
             task_id=task_id,
             shot_plan=shot_plan,
@@ -2448,7 +2470,9 @@ def download_videos(
             material_directory=material_directory,
             on_task_created=on_task_created,
             progress_callback=progress_callback,
-            **({"on_clip_completed": on_clip_completed} if source == "wan3" else {}),
+            **({"on_clip_completed": on_clip_completed}
+               if source in {"wan3", "volcengine_seedance"} else {}),
+            **run_options,
         )
     if source == "wan3":
         return _download_videos_wan3_on_demand(
@@ -2461,6 +2485,7 @@ def download_videos(
             on_task_created=on_task_created,
             progress_callback=progress_callback,
             on_clip_completed=on_clip_completed,
+            **run_options,
         )
     if source == "infistar":
         return _download_videos_infistar_on_demand(
@@ -2491,7 +2516,11 @@ def download_videos(
             max_clip_duration=max_clip_duration,
             material_directory=material_directory,
             source=source,
-            endpoint_snapshot=jalapeno_video_endpoint,
+            endpoint_snapshot=(
+                volcengine_seedance.endpoint_from_run_config(video_run_config)
+                if source == "volcengine_seedance" and video_run_config is not None
+                else jalapeno_video_endpoint
+            ),
         )
     if source == "ofox":
         # 与 WaveSpeed/方舟相同的按需付费语义：OFox 网关的 /v1/videos 会创建
@@ -2769,8 +2798,9 @@ def _download_videos_seedance_on_demand(
     """顺序生成 Seedance 素材，覆盖配音时长后立即停止付费下单。"""
     service = jalapeno_video if source == "jalapeno" else volcengine_seedance
     generation_options = (
-        {"endpoint_snapshot": endpoint_snapshot}
-        if source == "jalapeno" and endpoint_snapshot is not None else {}
+        {} if endpoint_snapshot is None
+        else {"endpoint_snapshot": endpoint_snapshot} if source == "jalapeno"
+        else {"endpoint": endpoint_snapshot}
     )
     video_paths: List[str] = []
     material_sources: list[dict[str, Any]] = []
@@ -2832,7 +2862,11 @@ def _download_videos_seedance_on_demand(
 
         for item in video_items:
             saved_video_path = _save_generated_video_with_retry(
-                item.url, material_directory, source
+                item.url, material_directory, source,
+                **({"network_options": {
+                    "proxies": endpoint_snapshot.proxies,
+                    "tls_verify": endpoint_snapshot.tls_verify,
+                }} if endpoint_snapshot is not None and source == "volcengine_seedance" else {}),
             )
             if not saved_video_path:
                 # 远端任务已完成并产生费用，本地下载失败时必须把远端任务 ID
@@ -3047,6 +3081,7 @@ def _generate_wan3_materials(
     material_directory: str,
     on_task_created: Callable[[str], None] | None,
     stop_event=None,
+    run_config=None,
 ) -> Iterator[tuple[str, float, dict[str, Any], str]]:
     """Share submission, recovery IDs, download and media probing across callers."""
     def record_task(remote_task_id: str) -> None:
@@ -3061,13 +3096,20 @@ def _generate_wan3_materials(
         video_aspect=video_aspect,
         on_task_created=record_task,
         stop_event=stop_event,
+        **({"run_config": run_config} if run_config is not None else {}),
     )
     if not items:
         raise wan3.Wan3Error("Wan3 returned no material for a visual prompt")
     for item in items:
         info = item.source_info if isinstance(item.source_info, dict) else {}
         remote_task_id = str(info.get("asset_id") or "").strip()
-        saved_path = _save_generated_video_with_retry(item.url, material_directory, "wan3")
+        saved_path = _save_generated_video_with_retry(
+            item.url, material_directory, "wan3",
+            **({"network_options": {
+                "proxies": run_config.proxy_map() or {},
+                "tls_verify": True if run_config.tls_verify is None else run_config.tls_verify,
+            }} if run_config is not None else {}),
+        )
         if not saved_path:
             raise wan3.Wan3DownloadError(
                 f"Wan3 generated a paid video but download failed: id={remote_task_id or 'unknown'}",
@@ -3085,35 +3127,27 @@ def _generate_wan3_materials(
         yield saved_path, duration, record, remote_task_id
 
 
-def _report_wan3_count(callback, completed: int, total: int) -> None:
+def _report_wan3_count(callback, completed: int, total: int, label: str = "Wan3") -> None:
     if callback is not None:
         try:
             callback(completed, total)
         except Exception as exc:
-            logger.warning(f"Wan3 count callback failed: error={type(exc).__name__}")
+            logger.warning(f"{label} count callback failed: error={type(exc).__name__}")
 
 
 def _schedule_wan3(*, task_id, requests, video_aspect, material_directory,
                    on_task_created, progress_callback, on_clip_completed,
-                   required_duration=0, max_clip_duration=0):
+                   required_duration=0, max_clip_duration=0, run_config=None):
     """A bounded sliding window shared by both Wan3 material entry points."""
     # Config/aspect and every prompt/duration must be validated before workers
     # can start a paid request. Entry points validate their mode-specific fields.
-    wan3.validate_config()
+    if run_config is None:
+        wan3.validate_config()
     try:
         VideoAspect(video_aspect)
     except (TypeError, ValueError) as exc:
         raise wan3.Wan3Error("Wan3 video aspect is invalid") from exc
-    stop = threading.Event()
-    error_lock, callback_lock = threading.Lock(), threading.Lock()
-    errors = []
-    results = [None] * len(requests)
-
-    def fail(exc):
-        with error_lock:
-            if not errors:
-                errors.append(exc)
-            stop.set()
+    callback_lock = threading.Lock()
 
     def record_task(remote_id):
         # Includes the user's complete read/modify/write callback, not just append.
@@ -3123,17 +3157,49 @@ def _schedule_wan3(*, task_id, requests, video_aspect, material_directory,
             else:
                 _save_wan3_task_id(task_id, remote_id)
 
+    def generate(prompt, seconds, _plan, stop):
+        return _generate_wan3_materials(
+            task_id=task_id, prompt=prompt, request_seconds=seconds,
+            video_aspect=video_aspect, material_directory=material_directory,
+            on_task_created=record_task, stop_event=stop, run_config=run_config,
+        )
+
+    return _schedule_generated_clips(
+        task_id=task_id, requests=requests, generate=generate,
+        provider_error=wan3.Wan3Error, provider_label="Wan3",
+        concurrency=wan3.get_concurrency(run_config), thread_name_prefix="wan3-material",
+        progress_callback=progress_callback, on_clip_completed=on_clip_completed,
+        required_duration=required_duration, max_clip_duration=max_clip_duration,
+    )
+
+
+def _schedule_generated_clips(*, task_id, requests, generate, provider_error, provider_label,
+                              concurrency, thread_name_prefix, progress_callback,
+                              on_clip_completed, required_duration=0, max_clip_duration=0):
+    """Bounded sliding window for paid per-clip providers; results keep input order.
+
+    ``generate(prompt, seconds, plan, stop_event)`` submits one remote task and
+    returns ``(path, measured_duration, source_record, remote_id)`` items. The
+    first failure stops new dispatches; in-flight workers finish and keep IDs.
+    """
+    stop = threading.Event()
+    error_lock = threading.Lock()
+    errors = []
+    results = [None] * len(requests)
+
+    def fail(exc):
+        with error_lock:
+            if not errors:
+                errors.append(exc)
+            stop.set()
+
     def run(index):
         prompt, seconds, plan = requests[index]
         try:
             wan3_coordinator.check_stopped(stop)
-            items = list(_generate_wan3_materials(
-                task_id=task_id, prompt=prompt, request_seconds=seconds,
-                video_aspect=video_aspect, material_directory=material_directory,
-                on_task_created=record_task, stop_event=stop,
-            ))
+            items = list(generate(prompt, seconds, plan, stop))
             if not items:
-                raise wan3.Wan3Error("Wan3 returned no material for a visual prompt")
+                raise provider_error(f"{provider_label} returned no material for a visual prompt")
             if plan is not None:
                 items = items[:1]
                 _, duration, record, remote_id = items[0]
@@ -3141,8 +3207,8 @@ def _schedule_wan3(*, task_id, requests, video_aspect, material_directory,
                 playback = float(getattr(plan, "target_playback_seconds", 0) or 0)
                 shortfall = _STORYBOARD_FRAME_SECONDS * (required / playback if playback > 0 else 1.0)
                 if duration + shortfall + 1e-4 < required:
-                    raise wan3.Wan3Error(
-                        f"shot {plan.index} Wan3 material is too short: "
+                    raise provider_error(
+                        f"shot {plan.index} {provider_label} material is too short: "
                         f"available={duration:.3f}s, required={required:.3f}s. "
                         "No additional paid generation was submitted.", task_id=remote_id,
                     )
@@ -3151,16 +3217,16 @@ def _schedule_wan3(*, task_id, requests, video_aspect, material_directory,
         except wan3_coordinator.SubmissionStopped:
             raise
         except Exception as exc:
-            if plan is not None and isinstance(exc, wan3.Wan3Error):
+            if plan is not None and isinstance(exc, provider_error):
                 exc = type(exc)(f"storyboard shot {plan.index}: {exc}", task_id=exc.task_id)
             fail(exc)
             raise exc
 
     completed, total_duration, next_index = 0, 0.0, 0
-    _report_wan3_count(on_clip_completed, 0, len(requests))
-    workers = min(wan3.get_concurrency(), len(requests))
+    _report_wan3_count(on_clip_completed, 0, len(requests), provider_label)
+    workers = min(concurrency, len(requests))
     with ThreadPoolExecutor(max_workers=workers,
-                            thread_name_prefix="wan3-material") as executor:
+                            thread_name_prefix=thread_name_prefix) as executor:
         pending = {}
 
         def fill_window():
@@ -3181,7 +3247,7 @@ def _schedule_wan3(*, task_id, requests, video_aspect, material_directory,
                 except wan3_coordinator.SubmissionStopped:
                     continue
                 except Exception as exc:
-                    if plan is not None and isinstance(exc, wan3.Wan3Error):
+                    if plan is not None and isinstance(exc, provider_error):
                         plan.remote_task_id = exc.task_id or None
                     continue  # The worker already saved the first actual error.
                 results[index] = items
@@ -3200,21 +3266,183 @@ def _schedule_wan3(*, task_id, requests, video_aspect, material_directory,
                     try:
                         progress_callback(fraction)
                     except Exception as exc:
-                        logger.warning(f"Wan3 progress callback failed: error={type(exc).__name__}")
-                _report_wan3_count(on_clip_completed, completed, len(requests))
+                        logger.warning(
+                            f"{provider_label} progress callback failed: error={type(exc).__name__}"
+                        )
+                _report_wan3_count(on_clip_completed, completed, len(requests), provider_label)
             fill_window()
     if errors:
         raise errors[0]
     if required_duration and total_duration + 0.001 < required_duration:
-        raise wan3.Wan3Error(
-            "Wan3 ordered materials do not cover the narration after actual-duration validation: "
+        raise provider_error(
+            f"{provider_label} ordered materials do not cover the narration after "
+            "actual-duration validation: "
             f"available={total_duration:.2f}s, required={required_duration:.2f}s; "
             "no additional paid task was submitted"
         )
     paths = [item[0] for result in results if result for item in result]
     mode = "ordered" if required_duration else "storyboard"
-    logger.success(f"generated and downloaded {len(paths)} {mode} Wan3 videos")
+    logger.success(f"generated and downloaded {len(paths)} {mode} {provider_label} videos")
     return paths
+
+
+def _validate_storyboard_plans(plans, *, minimum, maximum, label, error) -> None:
+    """Reject every invalid shot before the first paid request is dispatched."""
+    for plan in plans:
+        request = getattr(plan, "request_seconds", None)
+        prompt = str(getattr(plan, "prompt", "") or "").strip()
+        shot_index = getattr(plan, "index", "?")
+        if (isinstance(request, bool) or not isinstance(request, int)
+                or not minimum <= request <= maximum):
+            raise error(
+                f"shot {shot_index} {label} request must be an integer from "
+                f"{minimum} to {maximum} seconds"
+            )
+        if not prompt:
+            raise error(f"shot {shot_index} is missing a visual prompt")
+        try:
+            timing = [float(getattr(plan, field, 0) or 0) for field in (
+                "required_source_seconds", "target_playback_seconds",
+            )]
+            if any(not math.isfinite(value) or value < 0 for value in timing):
+                raise ValueError("invalid timing")
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise error(f"shot {shot_index} has invalid material timing") from exc
+
+
+SEEDANCE_LEDGER_NAME = "seedance-tasks.json"
+
+
+def _update_seedance_ledger(local_task_id: str, shot_index: int, **fields) -> None:
+    """Merge one shot's record; other shots and every known remote ID are kept."""
+    target = Path(utils.task_dir(local_task_id)) / SEEDANCE_LEDGER_NAME
+    with wan3_coordinator.file_lock(target.with_suffix(".lock")):
+        data = {"local_task_id": local_task_id, "provider": "volcengine_seedance",
+                "shots": {}, "task_ids": []}
+        if target.exists():
+            data = json.loads(target.read_text(encoding="utf-8"))
+            if (not isinstance(data, dict) or not isinstance(data.get("shots"), dict)
+                    or not isinstance(data.get("task_ids"), list)):
+                raise ValueError("Seedance task ledger is malformed")
+        key = str(shot_index)
+        entry = dict(data["shots"].get(key) or {})
+        entry.update(fields)
+        data["shots"][key] = entry
+        remote_id = entry.get("remote_id")
+        if remote_id:
+            data["task_ids"] = list(dict.fromkeys([*data["task_ids"], remote_id]))
+        wan3_coordinator.atomic_json(target, data)
+
+
+def _measure_generated_video(video_path: str) -> tuple[float, int, int]:
+    clip = None
+    try:
+        clip = VideoFileClip(video_path)
+        duration = float(clip.duration or 0)
+        width, height = (int(value) for value in clip.size)
+    finally:
+        if clip is not None:
+            try:
+                clip.close()
+            except Exception as close_error:
+                logger.warning(f"failed to close generated video: {type(close_error).__name__}")
+    if not math.isfinite(duration) or duration <= 0 or width <= 0 or height <= 0:
+        raise ValueError(f"generated video has no usable duration or size: {video_path}")
+    return duration, width, height
+
+
+def _download_storyboard_seedance(
+    *,
+    task_id: str,
+    shot_plan: list,
+    video_aspect: VideoAspect,
+    material_directory: str,
+    on_task_created: Callable[[str], None] | None = None,
+    progress_callback: Callable[[float], None] | None = None,
+    on_clip_completed: Callable[[int, int], None] | None = None,
+    video_run_config=None,
+) -> List[str]:
+    """Generate one Seedance clip per shot with the task's frozen gateway config."""
+    error = volcengine_seedance.VolcEngineSeedanceError
+    run_config = video_run_config
+    if run_config is None or run_config.source != "volcengine_seedance":
+        raise error("storyboard Seedance requires the task's environment video configuration")
+    plans = list(shot_plan)
+    if not plans:
+        raise error("storyboard Seedance shot plan is empty")
+    _validate_storyboard_plans(
+        plans, minimum=run_config.min_duration, maximum=run_config.max_duration,
+        label="Seedance", error=error,
+    )
+    try:
+        aspect = VideoAspect(video_aspect)
+    except (TypeError, ValueError) as exc:
+        raise error("Seedance video aspect is invalid") from exc
+    endpoint = volcengine_seedance.endpoint_from_run_config(run_config)
+    identity = run_config.credential_fingerprint()
+
+    def generate(prompt, seconds, plan, stop):
+        shot = plan.index
+
+        def record_task(remote_id):
+            # The ledger is the recovery record: failing to write it stops dispatch.
+            _update_seedance_ledger(
+                task_id, shot, shot=shot, endpoint=endpoint.tasks_url, model=endpoint.model,
+                request_seconds=seconds, remote_id=remote_id, status="submitted",
+            )
+            if on_task_created is not None:
+                try:
+                    on_task_created(remote_id)
+                except Exception as exc:
+                    logger.warning(f"could not update Seedance task state: {type(exc).__name__}")
+
+        item = volcengine_seedance.generate_coordinated_clip(
+            prompt, seconds, aspect, endpoint=endpoint, identity=identity,
+            on_task_created=record_task, stop_event=stop,
+        )
+        remote_id = str((item.source_info or {}).get("asset_id") or "").strip()
+        saved_path = _save_generated_video_with_retry(
+            item.url, material_directory, endpoint.provider_id,
+            network_options={"proxies": endpoint.proxies, "tls_verify": endpoint.tls_verify},
+        )
+        if not saved_path:
+            raise volcengine_seedance.VolcEngineSeedanceDownloadError(
+                f"Seedance generated a paid video but download failed: id={remote_id or 'unknown'}",
+                task_id=remote_id,
+            )
+        try:
+            duration, width, height = _measure_generated_video(saved_path)
+        except Exception as exc:
+            raise volcengine_seedance.VolcEngineSeedanceDownloadError(
+                f"Seedance paid output could not be measured: id={remote_id or 'unknown'}",
+                task_id=remote_id,
+            ) from exc
+        item.duration = duration
+        item.source_info = {
+            **(item.source_info or {}),
+            "rendition": {"id": remote_id, "width": width, "height": height},
+        }
+        try:
+            _update_seedance_ledger(
+                task_id, shot, status="downloaded", actual_seconds=duration,
+                width=width, height=height, local_file=saved_path,
+            )
+        except Exception as exc:
+            raise error(
+                f"Seedance task ledger could not be updated after download: id={remote_id}",
+                task_id=remote_id,
+            ) from exc
+        record = _material_source_record(item, saved_path)
+        record["duration"] = duration
+        return [(saved_path, duration, record, remote_id)]
+
+    return _schedule_generated_clips(
+        task_id=task_id,
+        requests=[(str(plan.prompt).strip(), plan.request_seconds, plan) for plan in plans],
+        generate=generate, provider_error=error, provider_label="Seedance",
+        concurrency=run_config.concurrency, thread_name_prefix="seedance-material",
+        progress_callback=progress_callback, on_clip_completed=on_clip_completed,
+    )
 
 
 def _download_storyboard_wan3(
@@ -3226,37 +3454,24 @@ def _download_storyboard_wan3(
     on_task_created: Callable[[str], None] | None = None,
     progress_callback: Callable[[float], None] | None = None,
     on_clip_completed: Callable[[int, int], None] | None = None,
+    video_run_config=None,
 ) -> List[str]:
     """Generate one Wan3 clip per storyboard shot. Validate every request first."""
     plans = list(shot_plan)
     if not plans:
         raise wan3.Wan3Error("storyboard Wan3 shot plan is empty")
-    for plan in plans:
-        request = getattr(plan, "request_seconds", None)
-        prompt = str(getattr(plan, "prompt", "") or "").strip()
-        shot_index = getattr(plan, "index", "?")
-        if (isinstance(request, bool) or not isinstance(request, int)
-                or not wan3.MIN_CLIP_SECONDS <= request <= wan3.MAX_CLIP_SECONDS):
-            raise wan3.Wan3Error(
-                f"shot {shot_index} Wan3 request must be an integer from 2 to 30 seconds"
-            )
-        if not prompt:
-            raise wan3.Wan3Error(f"shot {shot_index} is missing a visual prompt")
-        try:
-            timing = [float(getattr(plan, field, 0) or 0) for field in (
-                "required_source_seconds", "target_playback_seconds",
-            )]
-            if any(not math.isfinite(value) or value < 0 for value in timing):
-                raise ValueError("invalid timing")
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise wan3.Wan3Error(f"shot {shot_index} has invalid material timing") from exc
+    minimum = wan3.MIN_CLIP_SECONDS if video_run_config is None else video_run_config.min_duration
+    maximum = wan3.MAX_CLIP_SECONDS if video_run_config is None else video_run_config.max_duration
+    _validate_storyboard_plans(
+        plans, minimum=minimum, maximum=maximum, label="Wan3", error=wan3.Wan3Error,
+    )
 
     return _schedule_wan3(
         task_id=task_id,
         requests=[(str(plan.prompt).strip(), plan.request_seconds, plan) for plan in plans],
         video_aspect=video_aspect, material_directory=material_directory,
         on_task_created=on_task_created, progress_callback=progress_callback,
-        on_clip_completed=on_clip_completed,
+        on_clip_completed=on_clip_completed, run_config=video_run_config,
     )
 
 
@@ -3271,6 +3486,7 @@ def _download_videos_wan3_on_demand(
     on_task_created: Callable[[str], None] | None = None,
     progress_callback: Callable[[float], None] | None = None,
     on_clip_completed: Callable[[int, int], None] | None = None,
+    video_run_config=None,
 ) -> List[str]:
     """Generate each ordered visual prompt once, then verify actual coverage."""
     try:
@@ -3298,6 +3514,7 @@ def _download_videos_wan3_on_demand(
         on_task_created=on_task_created, progress_callback=progress_callback,
         on_clip_completed=on_clip_completed,
         required_duration=required_duration, max_clip_duration=max_clip_duration,
+        run_config=video_run_config,
     )
 
 

@@ -99,7 +99,8 @@ class TestMptAgentSkill(unittest.TestCase):
                 self.assertEqual(status, 0)
                 validation.assert_called_once()
                 generate.assert_called_once_with(
-                    root.resolve(), "owned topic", [*forwarded, "--match-materials-to-script"]
+                    root.resolve(), "owned topic", [*forwarded, "--match-materials-to-script"],
+                    env={},
                 )
 
     def test_source_option_default_and_single_value_controls(self):
@@ -109,7 +110,15 @@ class TestMptAgentSkill(unittest.TestCase):
                           ["--video-source", "local", "--video-materials", "./owned.mp4"]):
             with self.subTest(forwarded=forwarded):
                 actual = cli.parse_args(["--video-subject", "owned topic", *forwarded])
-                self.assertEqual(mpt_agent.selected_video_source(forwarded), actual.video_source)
+                explicit = any(
+                    item == "--video-source" or str(item).startswith("--video-source=")
+                    for item in forwarded
+                )
+                if explicit:
+                    self.assertEqual(mpt_agent.selected_video_source(forwarded), actual.video_source)
+                else:
+                    self.assertEqual(mpt_agent.selected_video_source(forwarded), "")
+                    self.assertEqual(actual.video_source, "wan3")
 
     def create_project(self, root: Path) -> None:
         """创建足够完成安装和配置检查的最小项目结构。"""
@@ -250,7 +259,7 @@ class TestMptAgentSkill(unittest.TestCase):
                 config_path, ["--video-source", "pixabay"]
             )
 
-            self.assertEqual(default_missing, ["wan3_api_key", "wan3_base_url"])
+            self.assertEqual(default_missing, [])
             self.assertEqual(pixabay_missing, [])
 
     def test_local_video_source_requires_video_materials(self):
@@ -496,28 +505,21 @@ class TestMptAgentSkill(unittest.TestCase):
                 encoding="utf-8",
             )
 
+            # Config.toml video keys no longer satisfy or block the environment path.
             _, missing = mpt_agent.missing_config(
                 config_path, ["--video-source", "volcengine_seedance"]
             )
-            self.assertEqual(
-                missing,
-                ["volcengine_seedance_api_key", "confirm_seedance_charge"],
-            )
-
+            self.assertEqual(missing, [])
             config_path.write_text(
                 config_path.read_text(encoding="utf-8").replace(
                     'volcengine_seedance_api_key = ""',
-                    'volcengine_seedance_api_key = "configured"',
+                    'volcengine_seedance_api_key = "configured-toml-secret"',
                 ),
                 encoding="utf-8",
             )
             _, confirmed_missing = mpt_agent.missing_config(
                 config_path,
-                [
-                    "--video-source",
-                    "volcengine_seedance",
-                    "--confirm-seedance-charge",
-                ],
+                ["--video-source", "volcengine_seedance", "--confirm-seedance-charge"],
             )
             self.assertEqual(confirmed_missing, [])
 
@@ -1302,6 +1304,142 @@ class TestMptAgentSkill(unittest.TestCase):
                 ["--voice-name=en-US-JennyNeural-Female"], "--voice-name"
             )
         )
+
+    def _environment_project(self, root: Path) -> str:
+        root.mkdir()
+        (root / "cli.py").write_text(
+            "_CLI_VIDEO_SOURCES = ('wan3', 'volcengine_seedance', 'pexels', 'local')\n"
+            "parser.add_argument('--storyboard')\n"
+            "parser.add_argument('--video-config-from-env')\n",
+            encoding="utf-8",
+        )
+        (root / "config.example.toml").write_text(MINIMAL_CONFIG, encoding="utf-8")
+        services = root / "app" / "services"
+        services.mkdir(parents=True)
+        source = Path(__file__).resolve().parents[2] / "app" / "services" / "video_run_config.py"
+        (services / "video_run_config.py").write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+        config = (
+            '[app]\nllm_provider = "ollama"\n'
+            'wan3_api_key = "old-config-secret"\n'
+            'wan3_base_url = "https://old.example"\n'
+            'wan3_model_name = "old-model"\n'
+            'volcengine_seedance_api_key = "old-seedance-secret"\n'
+        )
+        (root / "config.toml").write_text(config, encoding="utf-8")
+        return config
+
+    def test_environment_video_questions_leave_config_and_do_not_start(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "mpt"
+            original = self._environment_project(root)
+            cases = (
+                ({}, "INPUT_REASON=no_video_key"),
+                ({
+                    "MPT_WAN3_API_KEY": "wan-secret",
+                    "MPT_WAN3_BASE_URL": "https://wan.example",
+                    "MPT_WAN3_MODEL_NAME": "wan3.0-video",
+                    "MPT_SEEDANCE_API_KEY": "only-a-key",
+                }, "INPUT_REASON=multiple_video_keys"),
+                ({"MPT_WAN3_API_KEY": "wan-secret"}, "MISSING=MPT_WAN3_BASE_URL"),
+            )
+            for environ, marker in cases:
+                with self.subTest(marker=marker):
+                    output = io.StringIO()
+                    with (
+                        patch.dict(os.environ, environ, clear=True),
+                        redirect_stdout(output),
+                        patch.object(mpt_agent, "generate_video", side_effect=AssertionError("started")),
+                    ):
+                        status = mpt_agent.main(["--subject", "topic", "--root", str(root)])
+                    text = output.getvalue()
+                    self.assertEqual(status, 10)
+                    self.assertIn("MPT_NEEDS_INPUT", text)
+                    self.assertIn(marker, text)
+                    self.assertNotIn("wan-secret", text)
+                    self.assertNotIn("only-a-key", text)
+                    self.assertNotIn("old-config-secret", text)
+                    self.assertEqual((root / "config.toml").read_text(encoding="utf-8"), original)
+            explicit = io.StringIO()
+            with (
+                patch.dict(os.environ, {
+                    "MPT_WAN3_API_KEY": "wan-secret",
+                    "MPT_WAN3_BASE_URL": "https://wan.example",
+                    "MPT_WAN3_MODEL_NAME": "wan3.0-video",
+                }, clear=True),
+                redirect_stdout(explicit),
+                patch.object(mpt_agent, "generate_video", side_effect=AssertionError("started")),
+            ):
+                status = mpt_agent.main([
+                    "--subject", "topic", "--root", str(root), "--",
+                    "--video-source", "volcengine_seedance",
+                ])
+            text = explicit.getvalue()
+            self.assertEqual(status, 10)
+            self.assertIn("INPUT_REASON=missing_video_settings", text)
+            self.assertIn("MISSING=MPT_SEEDANCE_API_KEY", text)
+            self.assertIn("MISSING=MPT_SEEDANCE_BASE_URL", text)
+            self.assertIn("MISSING=MPT_SEEDANCE_MODEL_NAME", text)
+            self.assertNotIn("VIDEO_SOURCE_OPTION=wan3", text)
+            self.assertEqual((root / "config.toml").read_text(encoding="utf-8"), original)
+
+    def test_single_environment_provider_freezes_child_env_without_writing_config(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "mpt"
+            original = self._environment_project(root)
+            captured = {}
+
+            def generate(_root, _subject, cli_args, env=None):
+                captured["cli"] = list(cli_args)
+                captured["env"] = dict(env or {})
+                video = root / "final-1.mp4"
+                video.write_bytes(b"video")
+                return [video], root, root / "run.log", root / "result.json"
+
+            output = io.StringIO()
+            with (
+                patch.dict(os.environ, {
+                    "MPT_SEEDANCE_API_KEY": "",
+                    "MPT_VOLCENGINE_ARK_API_KEY": "gateway-secret",
+                    "VOLCENGINE_ARK_API_KEY": "stale-alias",
+                    "MPT_SEEDANCE_BASE_URL": "https://gateway.example/api/v3/",
+                    "MPT_SEEDANCE_MODEL_NAME": "Doubao-Seedance-2-0-Fast-260128",
+                }, clear=True),
+                redirect_stdout(output),
+                patch.object(mpt_agent, "generate_video", side_effect=generate),
+            ):
+                status = mpt_agent.main(["--subject", "topic", "--root", str(root)])
+            self.assertEqual(status, 0)
+            self.assertEqual(captured["cli"][:2], ["--video-source", "volcengine_seedance"])
+            self.assertIn("--video-config-from-env", captured["cli"])
+            self.assertIn("--confirm-seedance-charge", captured["cli"])
+            self.assertEqual(captured["env"]["MPT_SEEDANCE_API_KEY"], "gateway-secret")
+            self.assertEqual(captured["env"]["VOLCENGINE_ARK_API_KEY"], "gateway-secret")
+            self.assertIn("/contents/generations/tasks", captured["env"]["MPT_SEEDANCE_BASE_URL"])
+            self.assertNotIn("gateway-secret", output.getvalue())
+            self.assertNotIn("stale-alias", output.getvalue())
+            self.assertEqual((root / "config.toml").read_text(encoding="utf-8"), original)
+
+    def test_generate_video_passes_the_frozen_environment(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            task_id = "12345678-1234-1234-1234-123456789abc"
+            frozen = {"MPT_WAN3_API_KEY": "frozen-secret", "PATH": "kept"}
+
+            def finish(_command, **kwargs):
+                task = root / "storage" / "tasks" / task_id
+                task.mkdir(parents=True)
+                (task / "final-1.mp4").write_bytes(b"video")
+                self.assertEqual(kwargs["env"]["MPT_WAN3_API_KEY"], "frozen-secret")
+                self.assertEqual(kwargs["env"]["PATH"], "kept")
+                return SimpleNamespace(returncode=0, stdout="")
+
+            with (
+                patch.object(mpt_agent.shutil, "which", return_value="uv"),
+                patch.object(mpt_agent, "run_checked"),
+                patch.object(mpt_agent.uuid, "uuid4", return_value=task_id),
+                patch.object(mpt_agent.subprocess, "run", side_effect=finish),
+            ):
+                mpt_agent.generate_video(root, "topic", ["--video-source", "wan3"], env=frozen)
 
 
 if __name__ == "__main__":

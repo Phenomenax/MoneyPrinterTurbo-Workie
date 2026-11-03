@@ -720,6 +720,14 @@ Batch manifests:
         "--progress-file", default=None, metavar="PATH",
         help="optional atomic JSON progress snapshot for a single CLI task",
     )
+    execution_group.add_argument(
+        "--video-config-from-env", action="store_true",
+        help=(
+            "single task only: read the explicit --video-source (wan3 or "
+            "volcengine_seedance) API key, base URL and model name from "
+            "MPT_<PROVIDER>_* environment variables once, without config.toml fallback"
+        ),
+    )
     execution_mode = execution_group.add_mutually_exclusive_group()
     execution_mode.add_argument(
         "--task-id",
@@ -739,6 +747,19 @@ Batch manifests:
     args = parser.parse_args(argv)
     if args.progress_file and args.batch_file:
         parser.error("--progress-file is only supported for a single task")
+    if args.video_config_from_env:
+        from app.services.video_run_config import SOURCES as ENV_VIDEO_SOURCES
+
+        supplied = list(sys.argv[1:] if argv is None else argv)
+        if args.batch_file:
+            parser.error("--video-config-from-env cannot be combined with --batch-file")
+        if not any(token.split("=", 1)[0] == "--video-source" for token in supplied):
+            parser.error("--video-config-from-env requires an explicit --video-source")
+        if args.video_source not in ENV_VIDEO_SOURCES:
+            parser.error(
+                "--video-config-from-env supports --video-source "
+                + " or ".join(ENV_VIDEO_SOURCES)
+            )
     args.storyboard_data = None
     if args.storyboard is not None:
         supplied = list(sys.argv[1:] if argv is None else argv)
@@ -1724,6 +1745,27 @@ def prepare_cli_files(params: VideoParams, stop_at: str) -> None:
         raise
 
 
+def _video_run_config_from_environment(source: str):
+    """Freeze this process's environment selection once for the whole task."""
+    from app.config import config
+    from app.services import video_run_config as vrc
+    from app.services import volcengine_seedance, wan3
+
+    resolved = vrc.resolve_video_run_config(dict(os.environ), source)
+    if isinstance(resolved, vrc.VideoInputRequired):
+        raise ValueError(
+            "environment video configuration is incomplete or invalid: "
+            + "; ".join(resolved.lines())
+        )
+    provider = wan3 if source == vrc.WAN3 else volcengine_seedance
+    return resolved.with_runtime(
+        proxies=dict(config.proxy),
+        tls_verify=wan3._tls_verify(),
+        poll_interval=provider.DEFAULT_POLL_INTERVAL_SECONDS,
+        run_timeout=provider.DEFAULT_RUN_TIMEOUT_SECONDS,
+    )
+
+
 def _run_batch_tasks(args: argparse.Namespace, tasks: list[VideoParams]) -> int:
     from app.services import task as tm
     from app.utils import utils
@@ -1820,6 +1862,10 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
     try:
         params = build_video_params(args)
         prepare_cli_files(params, stop_at=args.stop_at)
+        video_run_config = (
+            _video_run_config_from_environment(args.video_source)
+            if args.video_config_from_env else None
+        )
     except (ValueError, OSError) as exc:
         logger.error(f"invalid CLI input: {exc}")
         return 2
@@ -1850,6 +1896,7 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
             allow_server_file_input=True,
             storyboard_data=args.storyboard_data,
             storyboard_clip_duration=args.video_clip_duration,
+            **({"video_run_config": video_run_config} if video_run_config is not None else {}),
         )
         succeeded = bool(result) and result.get("state") != tm.const.TASK_STATE_FAILED
     except Exception as exc:

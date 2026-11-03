@@ -2,12 +2,42 @@
 
 import json
 import logging
+import math
 import os
+import re
 import threading
 from datetime import datetime, timezone
 from contextlib import suppress
 from pathlib import Path
 from uuid import uuid4
+
+ACTIVITY_PHASES = frozenset({
+    "submitting", "remote_queued", "generating", "checking", "generated",
+    "downloading", "verifying",
+})
+_IDENTIFIER = re.compile(r"^[\w.:-]{1,200}$")
+
+
+def public_activity(activity):
+    """Whitelist display fields; drop URLs, provider text and malformed values."""
+    if (not isinstance(activity, dict) or not isinstance(activity.get("phase"), str)
+            or activity["phase"] not in ACTIVITY_PHASES):
+        return None
+    result = {"phase": activity["phase"]}
+    for key in ("provider", "remote_id"):
+        value = activity.get(key)
+        if isinstance(value, str) and _IDENTIFIER.fullmatch(value):
+            result[key] = value
+    confirmed = activity.get("confirmed_at")
+    if type(confirmed) in (int, float) and math.isfinite(confirmed) and confirmed >= 0:
+        result["confirmed_at"] = confirmed
+    if isinstance(activity.get("retrying"), bool):
+        result["retrying"] = activity["retrying"]
+    for key in ("downloaded_bytes", "total_bytes"):
+        value = activity.get(key)
+        if type(value) is int and value >= 0:
+            result[key] = value
+    return result
 
 
 class TaskProgress:
@@ -50,6 +80,7 @@ class TaskProgress:
                 "percent": max(0, min(100, int(task.get("progress", 0)))),
                 "clips_completed": task.get("clips_completed"),
                 "clips_total": task.get("clips_total"),
+                "generation_activity": public_activity(task.get("generation_activity")),
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
             self.path.parent.mkdir(parents=True, exist_ok=True)
