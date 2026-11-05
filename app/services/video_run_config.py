@@ -48,6 +48,7 @@ REASON_MISSING_VIDEO_SETTINGS = "missing_video_settings"
 REASON_INVALID_VIDEO_SETTINGS = "invalid_video_settings"
 
 MAX_CONCURRENCY = 5
+DEFAULT_CONCURRENCY = {WAN3: 5, SEEDANCE: 3}
 MAX_MODEL_NAME_LENGTH = 200
 SEEDANCE_TASKS_PATH = "/contents/generations/tasks"
 SEEDANCE_DEFAULT_API_PREFIX = "/api/v3"
@@ -311,9 +312,9 @@ def _valid_text(value: str, maximum: int = MAX_MODEL_NAME_LENGTH) -> bool:
     return bool(value) and len(value) <= maximum and not _CONTROL_CHARACTERS.search(value)
 
 
-def _concurrency(raw: str) -> int | None:
+def _concurrency(raw: str, *, default: int) -> int | None:
     if not raw:
-        return MAX_CONCURRENCY
+        return default
     if not re.fullmatch(r"\d+", raw):
         return None
     value = int(raw)
@@ -383,7 +384,9 @@ def _resolve_source(environ: Mapping[str, str], source: str) -> VideoRunConfig |
         elif resolution and resolution not in _SEEDANCE_RESOLUTIONS:
             invalid.append(names["resolution"])
 
-    concurrency = _concurrency(_value(environ, names["concurrency"]))
+    concurrency = _concurrency(
+        _value(environ, names["concurrency"]), default=DEFAULT_CONCURRENCY[source],
+    )
     if concurrency is None:
         invalid.append(names["concurrency"])
 
