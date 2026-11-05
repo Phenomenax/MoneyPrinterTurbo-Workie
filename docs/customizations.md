@@ -2,7 +2,7 @@
 
 这里只记录同步 upstream（MoneyPrinterTurbo）时可能发生冲突、被覆盖或需要复核的定制点：修改了哪些上游文件，以及合并时必须保留的差异。
 
-内部新增模块、测试清单和功能实现细节不在这里逐项登记；内部扩展只登记其对上游文件的接入改动。Wan3 并发实现与运行边界见 [wan3-concurrency.md](../wan3-concurrency.md)。
+内部新增模块、测试清单和功能实现细节不在这里逐项登记；内部扩展只登记其对上游文件的接入改动。只有上游原文件的实际差异或同步注意事项发生变化时才更新本清单。Wan3 并发实现与运行边界见 [wan3-concurrency.md](wan3-concurrency.md)。
 
 清单核对基线：2026-11-03，官方提交 [`ab6004e5`](https://github.com/harry0703/MoneyPrinterTurbo/commit/ab6004e5858998b2ce99ac46c0f16675eea9ab6f)。后续同步须重新核对实际差异。
 
@@ -18,7 +18,8 @@
 | `docs/skill/mpt_agent.py` | Agent 执行协议 | 接入环境选源、分镜路径处理及机器可读反馈 | 标准调用不注入 Wan3；视频 Key、地址和模型只来自环境变量，完整分镜路径不写回 `config.toml`。保留旧配置补字段而不覆盖已有值；预检不得误索取完整分镜不需要的 LLM Key；能力检查包含配置模块 API 与 `--video-config-from-env`，不能只看版本号。保留任务 ID 匹配、当前运行结果校验、`MPT_FEEDBACK` 和脱敏；日志走 stderr；保留官方新增来源、凭据及计费确认逻辑 |
 | `docs/skill/SKILL.md` | Workie 调用约定 | 按环境变量选择视频供应商，按分镜执行并交付本次结果 | 保留相对 helper 命令、真实工作目录、长任务等待、逐镜头流程及失败恢复边界；不把 Wan3 写回默认来源，同步供应商说明时避免重复配置询问或盲目重提付费任务 |
 | `.gitignore` | 运行记录隔离 | 忽略 Wan3 与 Seedance 跨进程协调记录 | 保留 `/.agent-logs/wan3/` 和 `/.agent-logs/seedance-*/`；协调文件属于运行状态，不得提交到 Git，也不能在同步代码时顺手清理 |
-| `app/services/wan3.py`、`app/services/volcengine_seedance.py`、`app/services/wan3_coordinator.py`、`app/services/progress.py` | 视频供应商与进度导出 | 让一次任务的环境快照贯穿校验、提交、轮询和下载，并导出白名单活动字段 | 快照存在时不得再读环境变量或 `config.app`。Wan3 协调目录和记录格式保持兼容；Seedance 使用独立命名空间。进度导出只保留固定阶段、供应商标识、远端 ID 和下载字节，失败不影响生成 |
+| `app/services/volcengine_seedance.py` | Seedance 分镜接入 | 接入任务配置快照、共享名额协调及远端任务状态反馈 | 保留快照配置在提交、轮询中的传递及下载所需素材信息；保留独立协调命名空间，提交或远端状态不确定时不得释放名额或自动重提；兼容官方非分镜调用 |
+| `.github/workflows/ci.yml`、`.github/workflows/docker-ghcr.yml`、`.github/workflows/security.yml` | 官方 CI/CD 删除 | 内部分支已移除这三份官方 workflow | 同步时检查上游修改或重新引入的 workflow，避免无意恢复已删除的自动执行流程 |
 
 ## 同步 upstream 时必须保证
 
