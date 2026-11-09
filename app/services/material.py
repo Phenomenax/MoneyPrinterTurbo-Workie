@@ -3158,10 +3158,16 @@ def _schedule_wan3(*, task_id, requests, video_aspect, material_directory,
                 _save_wan3_task_id(task_id, remote_id)
 
     def generate(prompt, seconds, _plan, stop):
+        from app.services.checkpoint_materials import submitted
+
+        def created(remote_id):
+            submitted(_plan, remote_id)
+            record_task(remote_id)
+
         return _generate_wan3_materials(
             task_id=task_id, prompt=prompt, request_seconds=seconds,
             video_aspect=video_aspect, material_directory=material_directory,
-            on_task_created=record_task, stop_event=stop, run_config=run_config,
+            on_task_created=created, stop_event=stop, run_config=run_config,
         )
 
     return _schedule_generated_clips(
@@ -3170,18 +3176,23 @@ def _schedule_wan3(*, task_id, requests, video_aspect, material_directory,
         concurrency=wan3.get_concurrency(run_config), thread_name_prefix="wan3-material",
         progress_callback=progress_callback, on_clip_completed=on_clip_completed,
         required_duration=required_duration, max_clip_duration=max_clip_duration,
+        checkpoint_config=run_config, material_directory=material_directory,
     )
 
 
 def _schedule_generated_clips(*, task_id, requests, generate, provider_error, provider_label,
                               concurrency, thread_name_prefix, progress_callback,
-                              on_clip_completed, required_duration=0, max_clip_duration=0):
+                              on_clip_completed, required_duration=0, max_clip_duration=0,
+                              checkpoint_config=None, material_directory=""):
     """Bounded sliding window for paid per-clip providers; results keep input order.
 
     ``generate(prompt, seconds, plan, stop_event)`` submits one remote task and
     returns ``(path, measured_duration, source_record, remote_id)`` items. The
     first failure stops new dispatches; in-flight workers finish and keep IDs.
     """
+    from app.services import checkpoint_materials
+
+    cached = checkpoint_materials.prepare(requests, checkpoint_config, material_directory)
     stop = threading.Event()
     error_lock = threading.Lock()
     errors = []
@@ -3197,7 +3208,11 @@ def _schedule_generated_clips(*, task_id, requests, generate, provider_error, pr
         prompt, seconds, plan = requests[index]
         try:
             wan3_coordinator.check_stopped(stop)
-            items = list(generate(prompt, seconds, plan, stop))
+            if index in cached:
+                items = cached[index]
+            else:
+                checkpoint_materials.begin(plan)
+                items = list(generate(prompt, seconds, plan, stop))
             if not items:
                 raise provider_error(f"{provider_label} returned no material for a visual prompt")
             if plan is not None:
@@ -3213,10 +3228,17 @@ def _schedule_generated_clips(*, task_id, requests, generate, provider_error, pr
                         "No additional paid generation was submitted.", task_id=remote_id,
                     )
                 record["storyboard_shot"] = plan.index
+            checkpoint_materials.completed(plan, items)
             return items
         except wan3_coordinator.SubmissionStopped:
+            from app.services.storyboard_checkpoint import CURRENT
+
+            checkpoint = CURRENT.get()
+            if checkpoint is not None and plan is not None and not checkpoint.clip(plan.index).get("remote_id"):
+                checkpoint.clip(plan.index, status="pending")
             raise
         except Exception as exc:
+            checkpoint_materials.failed(plan, exc)
             if plan is not None and isinstance(exc, provider_error):
                 exc = type(exc)(f"storyboard shot {plan.index}: {exc}", task_id=exc.task_id)
             fail(exc)
@@ -3386,6 +3408,9 @@ def _download_storyboard_seedance(
 
         def record_task(remote_id):
             # The ledger is the recovery record: failing to write it stops dispatch.
+            from app.services.checkpoint_materials import submitted
+
+            submitted(plan, remote_id)
             _update_seedance_ledger(
                 task_id, shot, shot=shot, endpoint=endpoint.tasks_url, model=endpoint.model,
                 request_seconds=seconds, remote_id=remote_id, status="submitted",
@@ -3442,6 +3467,7 @@ def _download_storyboard_seedance(
         generate=generate, provider_error=error, provider_label="Seedance",
         concurrency=run_config.concurrency, thread_name_prefix="seedance-material",
         progress_callback=progress_callback, on_clip_completed=on_clip_completed,
+        checkpoint_config=run_config, material_directory=material_directory,
     )
 
 

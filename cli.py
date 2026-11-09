@@ -744,7 +744,16 @@ Batch manifests:
             "generates a UUID for every task"
         ),
     )
+    parser.add_argument("--storyboard-checkpoint", action="store_true", help="save resumable storyboard checkpoints")
+    parser.add_argument("--resume-storyboard", action="store_true", help="resume the same checkpointed task, never an unknown submission")
+    parser.add_argument("--allow-checkpoint-rebuild", action="store_true", help="explicitly approve rebuilding missing or damaged checkpoint files")
     args = parser.parse_args(argv)
+    if args.storyboard_checkpoint or args.resume_storyboard or args.allow_checkpoint_rebuild:
+        if not args.storyboard or not args.task_id or args.batch_file:
+            parser.error("storyboard checkpoints require --storyboard and --task-id for a single task")
+        if args.allow_checkpoint_rebuild and not args.resume_storyboard:
+            parser.error("--allow-checkpoint-rebuild requires --resume-storyboard")
+        args.storyboard_checkpoint = True
     if args.progress_file and args.batch_file:
         parser.error("--progress-file is only supported for a single task")
     if args.video_config_from_env:
@@ -1886,7 +1895,15 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
         reporter = TaskProgress(args.progress_file, task_id, sm.state)
         reporter.start()
     try:
-        result = tm.start(
+        entrypoint = tm.start
+        checkpoint_options = {}
+        if args.storyboard_checkpoint:
+            from app.services.storyboard_checkpoint import start as checkpoint_start
+
+            entrypoint = checkpoint_start
+            checkpoint_options = {"resume": args.resume_storyboard,
+                                  "allow_rebuild": args.allow_checkpoint_rebuild}
+        result = entrypoint(
             task_id=task_id,
             params=params,
             stop_at=args.stop_at,
@@ -1897,6 +1914,7 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
             storyboard_data=args.storyboard_data,
             storyboard_clip_duration=args.video_clip_duration,
             **({"video_run_config": video_run_config} if video_run_config is not None else {}),
+            **checkpoint_options,
         )
         succeeded = bool(result) and result.get("state") != tm.const.TASK_STATE_FAILED
     except Exception as exc:

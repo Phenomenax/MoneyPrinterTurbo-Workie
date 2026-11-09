@@ -328,6 +328,18 @@ def _submit_and_wait(slot, payload, base_url, headers, api_key,
     )]
 
 
+def recover_video(task_id, prompt, seconds, run_config):
+    """Query the original paid task; this function never submits a POST."""
+    headers = {"Authorization": f"Bearer {run_config.api_key}", "Content-Type": "application/json"}
+    task = _wait_for_task(task_id=task_id, base_url=run_config.endpoint, headers=headers,
+                          api_key=run_config.api_key, run_config=run_config)
+    url = task["output"].get("video_url")
+    if not isinstance(url, str) or urlsplit(url).scheme not in {"http", "https"}:
+        raise Wan3DownloadError("original task has no downloadable result", task_id=task_id)
+    return MaterialInfo(provider="wan3", url=url, duration=seconds,
+                        source_info={"provider": "wan3", "search_term": prompt, "asset_id": task_id})
+
+
 def _probe_terminal(task_id, base_url, headers, run_config=None):
     """Read-only recovery of an orphan; never resubmit or assume a timeout ended it."""
     response = trace_http_call(

@@ -1954,7 +1954,9 @@ def _run_pipeline(
     if use_storyboard_timing:
         try:
             _reject_storyboard_external_audio(params, voice_preview)
-            storyboard_timeline = storyboard_timing.synthesize_timeline(
+            from app.services.storyboard_checkpoint import run as checkpoint_run
+
+            storyboard_timeline = checkpoint_run("audio", lambda: storyboard_timing.synthesize_timeline(
                 task_dir=utils.task_dir(task_id),
                 shots=storyboard_data.shots,
                 voice_name=params.voice_name,
@@ -1962,7 +1964,7 @@ def _run_pipeline(
                 voxcpm_reference_audio=voxcpm_reference_audio,
                 voxcpm_prompt_audio=voxcpm_prompt_audio,
                 voxcpm_prompt_text=voxcpm_prompt_text,
-            )
+            ))
             task_artifacts.patch_script_data(task_id, **storyboard_timeline.script_updates())
         except storyboard_timing.StoryboardTimingError as exc:
             return _mark_task_failed(task_id, exc.stage, str(exc))
@@ -2019,13 +2021,13 @@ def _run_pipeline(
     if use_storyboard_timing:
         subtitle_provider = str(config.app.get("subtitle_provider", "edge") or "edge")
         try:
-            subtitle_path = storyboard_timing.write_storyboard_subtitles(
+            subtitle_path = checkpoint_run("subtitles", lambda: storyboard_timing.write_storyboard_subtitles(
                 storyboard_timeline,
                 subtitle_path=path.join(utils.task_dir(task_id), "subtitle.srt"),
                 subtitle_enabled=bool(params.subtitle_enabled),
                 subtitle_provider=subtitle_provider,
                 word_level=getattr(params, "subtitle_display_mode", "sentence") == "word_by_word",
-            )
+            ))
         except storyboard_timing.StoryboardTimingError as exc:
             return _mark_task_failed(task_id, exc.stage, str(exc))
     else:
@@ -2118,7 +2120,9 @@ def _run_pipeline(
     # 6. Generate final videos
     partial_results = {}
     try:
-        final_video_paths, combined_video_paths, generation_warnings = generate_final_videos(
+        from app.services.storyboard_checkpoint import run as checkpoint_run
+
+        final_video_paths, combined_video_paths, generation_warnings = checkpoint_run("render", lambda: generate_final_videos(
             task_id,
             params,
             downloaded_videos,
@@ -2127,7 +2131,7 @@ def _run_pipeline(
             audio_duration,
             partial_results=partial_results,
             shot_plan=shot_plan,
-        )
+        ))
     except Exception as exc:
         logger.exception(f"video batch failed, task_id: {task_id}, error: {exc}")
         # Warnings for the failing clip do not describe any usable output.

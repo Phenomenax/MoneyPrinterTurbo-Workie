@@ -31,6 +31,9 @@ class SubmissionStopped(RuntimeError):
 
 
 def check_stopped(stop_event):
+    pause_file = os.environ.get("MPT_BATCH_PAUSE_FILE")
+    if pause_file and Path(pause_file).exists():
+        raise SubmissionStopped("local video batch was stopped by the user")
     if stop_event is not None and stop_event.is_set():
         raise SubmissionStopped("Wan3 submission stopped after another clip failed")
 

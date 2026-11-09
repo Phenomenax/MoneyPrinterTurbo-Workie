@@ -593,6 +593,16 @@ def generate_coordinated_clip(
             slot.close()
 
 
+def recover_video(task_id, prompt, seconds, run_config):
+    """Recover the original task without submitting another paid request."""
+    endpoint = endpoint_from_run_config(run_config)
+    task = _wait_for_task(task_id=task_id, tasks_url=endpoint.tasks_url,
+                          headers={"Authorization": f"Bearer {endpoint.api_key}"},
+                          api_key=endpoint.api_key, endpoint=endpoint,
+                          run_timeout=endpoint.run_timeout, poll_interval=endpoint.poll_interval)
+    return _material(task, task_id, endpoint.provider_id, prompt, seconds, {"id": task_id})
+
+
 def _endpoint_namespace(tasks_url: str) -> str:
     return hashlib.sha256(tasks_url.encode("utf-8")).hexdigest()[:16]
 
