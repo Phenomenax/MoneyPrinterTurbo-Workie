@@ -630,7 +630,9 @@ def concat_video_clips_with_ffmpeg(
     threads: int,
     output_dir: str,
     max_duration: float | None = None,
+    stream_copy: bool = False,
 ):
+    # Only opt in for already-normalized clips; arbitrary inputs still re-encode.
     # Separate renders may share a directory. Each FFmpeg process must keep its
     # own manifest until all codec attempts finish, without overwriting or
     # deleting another render's list.
@@ -662,13 +664,15 @@ def concat_video_clips_with_ffmpeg(
             concat_list_file,
             "-c:v",
             codec,
-            "-threads",
-            str(threads or 2),
-            "-vf",
-            _BT709_VIDEO_FILTER,
-            "-pix_fmt",
-            "yuv420p",
         ]
+        if codec == "copy":
+            command.extend(["-map", "0:v:0", "-an"])
+        else:
+            command.extend([
+                "-threads", str(threads or 2),
+                "-vf", _BT709_VIDEO_FILTER,
+                "-pix_fmt", "yuv420p",
+            ])
         if max_duration is not None and max_duration > 0:
             command.extend(["-t", f"{max_duration:.3f}"])
         command.append(staged_output)
@@ -682,6 +686,8 @@ def concat_video_clips_with_ffmpeg(
         if result.returncode != 0:
             error_message = (result.stderr or result.stdout or "").strip()
             raise RuntimeError(error_message or "ffmpeg concat failed")
+        if codec == "copy" and os.path.getsize(staged_output) == 0:
+            raise RuntimeError("ffmpeg concat produced no output")
         return codec
 
     try:
@@ -691,18 +697,27 @@ def concat_video_clips_with_ffmpeg(
             dir=os.path.dirname(os.path.abspath(output_file)),
         )
         os.close(descriptor)
-        effective_codec = _get_effective_video_codec()
-        try:
-            result_codec = run_concat(effective_codec)
-        except TimeoutError:
-            # A hung encoder is not evidence that another codec will work. Do
-            # not spend a second timeout period retrying the same input.
-            raise
-        except Exception as exc:
-            if effective_codec == _DEFAULT_VIDEO_CODEC:
+        result_codec = None
+        if stream_copy and max_duration is None:
+            try:
+                result_codec = run_concat("copy")
+            except TimeoutError:
                 raise
-            result_codec = run_concat(_DEFAULT_VIDEO_CODEC)
-            _disable_runtime_video_codec(effective_codec, str(exc))
+            except Exception as exc:
+                logger.warning(f"ffmpeg stream copy failed, retrying with encoding: {exc}")
+        if result_codec is None:
+            effective_codec = _get_effective_video_codec()
+            try:
+                result_codec = run_concat(effective_codec)
+            except TimeoutError:
+                # A hung encoder is not evidence that another codec will work. Do
+                # not spend a second timeout period retrying the same input.
+                raise
+            except Exception as exc:
+                if effective_codec == _DEFAULT_VIDEO_CODEC:
+                    raise
+                result_codec = run_concat(_DEFAULT_VIDEO_CODEC)
+                _disable_runtime_video_codec(effective_codec, str(exc))
         # Failed attempts and in-progress output stay private until FFmpeg has
         # finished. Publication errors must not trigger another codec attempt.
         if os.path.getsize(staged_output) == 0:
@@ -1048,6 +1063,7 @@ def _combine_storyboard_shots(
     video_width, video_height = aspect.to_resolution()
     output_dir = os.path.dirname(combined_video_path)
     clip_files: list[str] = []
+    clip_codecs: set[str] = set()
     try:
         for index, (video_path, plan) in enumerate(zip(video_paths, shot_plan)):
             target = float(plan.target_playback_seconds)
@@ -1084,7 +1100,7 @@ def _combine_storyboard_shots(
                     dir=output_dir or ".", prefix="temp-clip-", suffix=".mp4", delete=False
                 ) as temporary_clip:
                     clip_file = temporary_clip.name
-                _write_videofile_with_codec_fallback(
+                clip_codec = _write_videofile_with_codec_fallback(
                     clip,
                     clip_file,
                     codec=_get_configured_video_codec(),
@@ -1099,6 +1115,7 @@ def _combine_storyboard_shots(
                     ],
                 )
                 clip_files.append(clip_file)
+                clip_codecs.add(clip_codec)
                 clip_file = None
                 if used_video_paths is not None:
                     used_video_paths.append(video_path)
@@ -1119,6 +1136,9 @@ def _combine_storyboard_shots(
             threads=threads,
             output_dir=output_dir,
             max_duration=None,
+            # These clips share dimensions, fps, pixel format and encoder settings.
+            # Keep hardware paths on the existing color-normalizing concat encode.
+            stream_copy=clip_codecs == {_DEFAULT_VIDEO_CODEC},
         )
     finally:
         delete_files(clip_files)
