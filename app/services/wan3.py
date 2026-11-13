@@ -180,7 +180,7 @@ def generate_videos(
     stop_event=None,
     run_config=None,
 ) -> list[MaterialInfo]:
-    """Submit one silent clip, save its remote ID, then poll the same task.
+    """Submit one clip (silent by default), save its ID, then poll the same task.
 
     ``run_config`` is the task's frozen environment selection; when present,
     neither environment variables nor ``config.app`` are read again.
@@ -219,7 +219,7 @@ def generate_videos(
             "resolution": resolution,
             "ratio": aspect.value,
             "duration": minimum_duration,
-            "audio": False,
+            "audio": bool(run_config is not None and run_config.generate_audio),
         },
     }
     try:

@@ -330,6 +330,10 @@ Batch manifests:
         help="Workie storyboard Markdown file; supplies narration and ordered visual prompts",
     )
     content_group.add_argument(
+        "--storyboard-audio-mode", choices=["tts", "native"], default="tts",
+        help="storyboard audio pipeline (default: tts); native retains model audio and captions",
+    )
+    content_group.add_argument(
         "--video-terms",
         default=None,
         help="comma-separated material search terms; generated automatically when omitted",
@@ -748,6 +752,15 @@ Batch manifests:
     parser.add_argument("--resume-storyboard", action="store_true", help="resume the same checkpointed task, never an unknown submission")
     parser.add_argument("--allow-checkpoint-rebuild", action="store_true", help="explicitly approve rebuilding missing or damaged checkpoint files")
     args = parser.parse_args(argv)
+    if args.storyboard_audio_mode == "native":
+        from app.services.storyboard_native import validate_native_arguments
+
+        if not args.storyboard or args.stop_at != "video" or args.batch_file or not args.video_config_from_env:
+            parser.error("native audio requires --storyboard, --stop-at video and --video-config-from-env for a single task")
+        try:
+            validate_native_arguments(list(sys.argv[1:] if argv is None else argv))
+        except ValueError as exc:
+            parser.error(str(exc))
     if args.storyboard_checkpoint or args.resume_storyboard or args.allow_checkpoint_rebuild:
         if not args.storyboard or not args.task_id or args.batch_file:
             parser.error("storyboard checkpoints require --storyboard and --task-id for a single task")
@@ -781,11 +794,12 @@ Batch manifests:
             parser.error("--storyboard requires sequential concatenation")
         if args.match_materials_to_script is False:
             parser.error("--storyboard cannot disable material ordering")
-        from app.services.storyboard import parse_storyboard
+        from app.services.storyboard import parse_native_storyboard, parse_storyboard
         try:
-            args.storyboard_data = parse_storyboard(
-                args.storyboard,
-                require_shot_timing=True,
+            args.storyboard_data = (
+                parse_native_storyboard(args.storyboard)
+                if args.storyboard_audio_mode == "native" else
+                parse_storyboard(args.storyboard, require_shot_timing=True)
             )
         except (OSError, ValueError) as exc:
             parser.error(str(exc))
@@ -1006,6 +1020,20 @@ def build_video_params(args: argparse.Namespace) -> VideoParams:
     # 避免执行 ``cli.py -h`` 时产生配置初始化日志。
     from app.config import config
     from app.models.schema import MaterialInfo, VideoParams
+
+    if args.storyboard_audio_mode == "native":
+        # Saved TTS, BGM, font and speed defaults cannot affect the native path
+        # or trigger validation of resources that it never uses.
+        return VideoParams(
+            video_subject=args.video_subject.strip(), video_script=args.video_script,
+            video_terms=args.video_terms, video_source=args.video_source,
+            video_count=1, video_aspect=args.video_aspect,
+            voice_name="no-voice", voice_rate=1, voice_volume=1, custom_audio_file="",
+            subtitle_enabled=False, font_name="", bgm_type="", bgm_file="", bgm_volume=0,
+            video_clip_speed=1, video_transition_mode=None, video_concat_mode="sequential",
+            match_materials_to_script=True, video_fit_mode=args.video_fit_mode or "cover",
+            n_threads=args.n_threads or 2,
+        )
 
     ui_config = config.ui
 
@@ -1875,6 +1903,10 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
             _video_run_config_from_environment(args.video_source)
             if args.video_config_from_env else None
         )
+        if args.storyboard_audio_mode == "native":
+            from app.services.storyboard_native import build_generation_plan
+
+            build_generation_plan(args.storyboard_data, video_run_config)
     except (ValueError, OSError) as exc:
         logger.error(f"invalid CLI input: {exc}")
         return 2
@@ -1913,6 +1945,7 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
             allow_server_file_input=True,
             storyboard_data=args.storyboard_data,
             storyboard_clip_duration=args.video_clip_duration,
+            **({"storyboard_audio_mode": "native"} if args.storyboard_audio_mode == "native" else {}),
             **({"video_run_config": video_run_config} if video_run_config is not None else {}),
             **checkpoint_options,
         )

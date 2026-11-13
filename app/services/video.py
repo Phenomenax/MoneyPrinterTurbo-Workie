@@ -631,6 +631,7 @@ def concat_video_clips_with_ffmpeg(
     output_dir: str,
     max_duration: float | None = None,
     stream_copy: bool = False,
+    preserve_audio: bool = False,
 ):
     # Only opt in for already-normalized clips; arbitrary inputs still re-encode.
     # Separate renders may share a directory. Each FFmpeg process must keep its
@@ -665,9 +666,12 @@ def concat_video_clips_with_ffmpeg(
             "-c:v",
             codec,
         ]
-        if codec == "copy":
+        if preserve_audio:
+            command.extend(["-map", "0:v:0", "-map", "0:a:0", "-c:a", "aac",
+                            "-ar", "48000", "-ac", "2"])
+        if codec == "copy" and not preserve_audio:
             command.extend(["-map", "0:v:0", "-an"])
-        else:
+        elif codec != "copy":
             command.extend([
                 "-threads", str(threads or 2),
                 "-vf", _BT709_VIDEO_FILTER,

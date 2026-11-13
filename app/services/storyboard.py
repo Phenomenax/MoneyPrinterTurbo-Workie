@@ -39,6 +39,17 @@ class Storyboard:
     shots: tuple[StoryboardShot, ...] = field(default_factory=tuple)
 
 
+@dataclass(frozen=True)
+class NativeStoryboardShot(StoryboardShot):
+    music_sfx: str = ""
+
+
+@dataclass(frozen=True)
+class NativeStoryboard(Storyboard):
+    narration_voice: str = ""
+    captions_guidance: str = ""
+
+
 def _section_match(text: str, name: str) -> re.Match[str]:
     match = re.search(
         r"^##[ \t]+" + name + r"[^\n]*\n(.*?)(?=^#{1,2}[ \t]|\Z)",
@@ -205,6 +216,7 @@ def _parse_shots(
     rows: list[tuple[int, str]],
     *,
     require_shot_timing: bool,
+    native: bool = False,
 ) -> tuple[list[str], tuple[StoryboardShot, ...]]:
     header_index = next(
         (
@@ -270,13 +282,18 @@ def _parse_shots(
                 end=end,
                 previous=shots[-1] if shots else None,
             )
+            shot_class = NativeStoryboardShot if native else StoryboardShot
+            music_sfx = ""
+            if native and not _is_silence_marker(cells[4]):
+                music_sfx = _require_filled(cells[4], f"Music / SFX at line {pending_line}")
             shots.append(
-                StoryboardShot(
+                shot_class(
                     index=len(shots) + 1,
                     prompt=prompt,
                     narration=narration,
                     planned_start_seconds=start,
                     planned_end_seconds=end,
+                    **({"music_sfx": music_sfx} if native else {}),
                 )
             )
         pending = ""
@@ -376,4 +393,28 @@ def parse_storyboard(path: str | Path, *, require_shot_timing: bool = False) -> 
         aspect=aspect,
         title=title,
         shots=shots,
+    )
+
+
+def parse_native_storyboard(path: str | Path) -> NativeStoryboard:
+    """Opt-in audio fields; the legacy parser and its serialized shape stay intact."""
+    board = parse_storyboard(path, require_shot_timing=True)
+    text, base_line = _load_text(path)
+    rows, _ = _beat_rows(text, base_line)
+    _, shots = _parse_shots(rows, require_shot_timing=True, native=True)
+
+    def guidance(name):
+        try:
+            value = _section(text, name)
+        except ValueError:
+            if board.video_script:
+                raise
+            return ""
+        return _require_filled(value, name) if board.video_script else value
+
+    return NativeStoryboard(
+        video_script=board.video_script, video_terms=board.video_terms,
+        aspect=board.aspect, title=board.title, shots=shots,
+        narration_voice=guidance("Narration voice"),
+        captions_guidance=guidance("Captions guidance"),
     )

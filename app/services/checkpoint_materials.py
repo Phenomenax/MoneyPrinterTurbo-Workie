@@ -42,7 +42,10 @@ def prepare(requests, run_config, material_directory):
             raise checkpoints.CheckpointError(
                 "only timed storyboard clips can be resumed"
             )
-        identity = checkpoints.fingerprint([prompt, seconds, run_config.summary()])
+        inputs = [prompt, seconds, run_config.summary()]
+        if getattr(run_config, "generate_audio", False):
+            inputs.append({"storyboard_audio_mode": "native"})
+        identity = checkpoints.fingerprint(inputs)
         record = checkpoint.clip(plan.index)
         if record.get("identity") and record["identity"] != identity:
             raise checkpoints.CheckpointError(
@@ -89,7 +92,9 @@ def prepare(requests, run_config, material_directory):
                 raise checkpoints.CheckpointError(
                     f"original shot {plan.index} result could not be downloaded"
                 )
-            duration, _width, _height = material._measure_generated_video(saved)
+            duration, _width, _height = material._measure_generated_video(
+                saved, **({"audio": False} if getattr(run_config, "generate_audio", False) else {}),
+            )
             info = material._material_source_record(item, saved)
             info.update(duration=duration, storyboard_shot=plan.index)
             items = [(str(Path(saved).resolve()), duration, info, remote_id)]

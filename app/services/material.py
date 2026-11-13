@@ -1171,11 +1171,11 @@ def _save_generated_video_with_retry(
     return ""
 
 
-def _get_downloaded_video_duration(video_path: str) -> float:
+def _get_downloaded_video_duration(video_path: str, *, audio: bool = True) -> float:
     """Read the usable duration from the downloaded media file."""
     clip = None
     try:
-        clip = VideoFileClip(video_path)
+        clip = VideoFileClip(video_path, **({"audio": False} if not audio else {}))
         duration = float(clip.duration or 0)
     except Exception as exc:
         raise ValueError(
@@ -3116,7 +3116,10 @@ def _generate_wan3_materials(
                 task_id=remote_task_id,
             )
         try:
-            duration = _get_downloaded_video_duration(saved_path)
+            duration = _get_downloaded_video_duration(
+                saved_path,
+                **({"audio": False} if getattr(run_config, "generate_audio", False) else {}),
+            )
         except Exception as exc:
             raise wan3.Wan3DownloadError(
                 f"Wan3 paid output duration could not be measured: id={remote_task_id or 'unknown'}",
@@ -3356,10 +3359,10 @@ def _update_seedance_ledger(local_task_id: str, shot_index: int, **fields) -> No
         wan3_coordinator.atomic_json(target, data)
 
 
-def _measure_generated_video(video_path: str) -> tuple[float, int, int]:
+def _measure_generated_video(video_path: str, *, audio: bool = True) -> tuple[float, int, int]:
     clip = None
     try:
-        clip = VideoFileClip(video_path)
+        clip = VideoFileClip(video_path, **({"audio": False} if not audio else {}))
         duration = float(clip.duration or 0)
         width, height = (int(value) for value in clip.size)
     finally:
@@ -3436,7 +3439,9 @@ def _download_storyboard_seedance(
                 task_id=remote_id,
             )
         try:
-            duration, width, height = _measure_generated_video(saved_path)
+            duration, width, height = _measure_generated_video(
+                saved_path, **({"audio": False} if run_config.generate_audio else {}),
+            )
         except Exception as exc:
             raise volcengine_seedance.VolcEngineSeedanceDownloadError(
                 f"Seedance paid output could not be measured: id={remote_id or 'unknown'}",

@@ -234,15 +234,22 @@ def start(
     from app.services import task
     from app.utils import utils
 
-    identity = fingerprint(
-        {
-            "params": params.model_dump(),
-            "storyboard": _pack(storyboard_data),
-            "video": kwargs.get("video_run_config").summary()
-            if kwargs.get("video_run_config") is not None
-            else None,
-        }
-    )
+    inputs = {
+        "params": params.model_dump(),
+        "storyboard": _pack(storyboard_data),
+        "video": kwargs.get("video_run_config").summary()
+        if kwargs.get("video_run_config") is not None
+        else None,
+    }
+    if kwargs.get("storyboard_audio_mode", "tts") == "native":
+        from app.services.storyboard_native import build_generation_plan
+
+        inputs["storyboard_audio_mode"] = "native"
+        inputs["native_requests"] = [
+            [plan.prompt, plan.request_seconds]
+            for plan in build_generation_plan(storyboard_data, kwargs.get("video_run_config"))
+        ]
+    identity = fingerprint(inputs)
     with scope(
         utils.task_dir(task_id),
         identity,

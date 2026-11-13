@@ -1684,10 +1684,12 @@ def _run_pipeline(
     storyboard_data=None,
     storyboard_clip_duration: int | None = None,
     video_run_config=None,
+    storyboard_audio_mode="tts",
 ):
     logger.info(f"start task: {task_id}, stop_at: {stop_at}")
     sm.state.update_task(
-        task_id, state=const.TASK_STATE_PROCESSING, progress=5, stage="script",
+        task_id, state=const.TASK_STATE_PROCESSING, progress=5,
+        stage="materials" if storyboard_audio_mode == "native" else "script",
         clips_completed=None, clips_total=None,
         failed_stage=None, error=None, error_key=None, error_params=None,
         videos=[], combined_videos=[], warnings=None, failed_video_index=None,
@@ -1695,6 +1697,13 @@ def _run_pipeline(
     )
 
     generation_progress.stage("preparing")
+    if storyboard_audio_mode == "native":
+        from app.services import storyboard_native
+
+        return storyboard_native.run(
+            task_id, params, storyboard_data, video_run_config, stop_at=stop_at,
+            explicit_clip_duration=storyboard_clip_duration,
+        )
     if video_run_config is not None and video_run_config.source != params.video_source:
         return _mark_task_failed(
             task_id, "preflight",
@@ -2230,6 +2239,7 @@ def start(
     storyboard_data=None,
     storyboard_clip_duration: int | None = None,
     video_run_config=None,
+    storyboard_audio_mode="tts",
 ):
     """
     执行任务流水线，并确保未预期异常也会转换成可查询的失败状态。
@@ -2252,6 +2262,7 @@ def start(
                 voxcpm_prompt_text=voxcpm_prompt_text,
                 storyboard_data=storyboard_data,
                 storyboard_clip_duration=storyboard_clip_duration,
+                **({"storyboard_audio_mode": storyboard_audio_mode} if storyboard_audio_mode != "tts" else {}),
                 **({"codex_image_context": codex_image_context}
                    if codex_image_context is not None else {}),
                 **({"jalapeno_video_endpoint": jalapeno_video_endpoint}
