@@ -48,6 +48,7 @@ class NativeStoryboardShot(StoryboardShot):
 class NativeStoryboard(Storyboard):
     narration_voice: str = ""
     captions_guidance: str = ""
+    music_mood: str = ""
 
 
 def _section_match(text: str, name: str) -> re.Match[str]:
@@ -412,9 +413,17 @@ def parse_native_storyboard(path: str | Path) -> NativeStoryboard:
             return ""
         return _require_filled(value, name) if board.video_script else value
 
+    try:
+        music_mood = _section(text, "Music mood")
+    except ValueError:
+        music_mood = ""  # Older native storyboards contain only per-shot music.
+    if _is_silence_marker(music_mood):
+        music_mood = ""
+
     return NativeStoryboard(
         video_script=board.video_script, video_terms=board.video_terms,
         aspect=board.aspect, title=board.title, shots=shots,
         narration_voice=guidance("Narration voice"),
         captions_guidance=guidance("Captions guidance"),
+        music_mood=music_mood,
     )

@@ -91,6 +91,45 @@ def test_native_fields_only_reach_their_own_shot_and_legacy_shape_is_unchanged(b
     assert board.shots[0].narration == "Alpha line."
 
 
+def test_full_music_design_and_unchanged_voice_reach_every_segment(board_path):
+    music = (
+        "Electronic piano, 88 BPM, restrained, no singing.\n"
+        "Segment 1: sparse notes and a gentle pulse.\n"
+        "Segment 2: light bass and a steady beat, open ending.\n"
+        "Segment 3: fewer notes and a gradual ending."
+    )
+    board_path.write_text(BOARD + "\n## Music mood\n" + music + "\n", encoding="utf-8")
+    board = parse_native_storyboard(board_path)
+    assert board.music_mood == music
+    plans = native.build_generation_plan(board, run_config())
+    for position, (shot, plan) in enumerate(zip(board.shots, plans, strict=True), start=1):
+        assert plan.prompt.count(music) == 1
+        assert plan.prompt.count(board.narration_voice) == 1
+        assert "keep the same perceived speaker, accent, age, pitch range, timbre" in plan.prompt
+        assert f"Current music segment: {position} of 3." in plan.prompt
+        assert (f"Planned position in the whole video: {shot.planned_start_seconds:g}–"
+                f"{shot.planned_end_seconds:g} seconds.") in plan.prompt
+        assert f"Generate only this {plan.request_seconds}-second segment" in plan.prompt
+        assert "do not generate the whole soundtrack or compress all segments" in plan.prompt
+        assert "current shot's concrete music / sound-effect instructions take precedence" in plan.prompt
+        other_lines = [other.narration for other in board.shots
+                       if other.index != shot.index and other.narration]
+        assert all(line not in plan.prompt for line in other_lines)
+    assert "No background music and no additional sound effects." in plans[2].prompt
+    assert "if they specify no music or effects, do not add them" in plans[2].prompt
+
+
+@pytest.mark.parametrize("music_section", ["", "\n## Music mood\n\n", "\n## Music mood\n—\n"])
+def test_old_native_storyboards_without_music_design_remain_readable(board_path, music_section):
+    board_path.write_text(BOARD + music_section, encoding="utf-8")
+    board = parse_native_storyboard(board_path)
+    assert board.music_mood == ""
+    plans = native.build_generation_plan(board, run_config())
+    assert "Whole-video music design" not in plans[0].prompt
+    assert "Warm piano at 80 BPM" in plans[0].prompt
+    assert "Current music segment: 1 of 3." in plans[0].prompt
+
+
 @pytest.mark.parametrize("section", ["Narration voice", "Captions guidance"])
 def test_missing_and_empty_guidance_fail_before_generation(board_path, section):
     import re
@@ -440,3 +479,6 @@ def test_legacy_checkpoint_identity_is_unchanged_and_native_inputs_are_fenced(tm
     changed = replace(options["storyboard_data"], narration_voice="A different voice")
     with pytest.raises(cp.CheckpointError, match="inputs changed"):
         cp.start(**(options | {"storyboard_data": changed}), resume=True)
+    changed_music = replace(options["storyboard_data"], music_mood="A new whole-video score")
+    with pytest.raises(cp.CheckpointError, match="inputs changed"):
+        cp.start(**(options | {"storyboard_data": changed_music}), resume=True)

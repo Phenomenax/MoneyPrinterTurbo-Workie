@@ -90,7 +90,7 @@ def build_generation_plan(storyboard, run_config):
     if not hasattr(storyboard, "narration_voice") or not hasattr(storyboard, "captions_guidance"):
         raise NativeStoryboardError("native storyboard must use parse_native_storyboard")
     plans = []
-    for shot in storyboard.shots:
+    for position, shot in enumerate(storyboard.shots, start=1):
         milliseconds = round(shot.planned_end_seconds * 1000) - round(shot.planned_start_seconds * 1000)
         if milliseconds <= 0:
             raise NativeStoryboardError("planned duration must be positive", shot=shot.index)
@@ -110,12 +110,27 @@ def build_generation_plan(storyboard, run_config):
             "Do not cut spoken words or captions at either boundary.",
             "Whole-video narration voice (description only, do not read aloud):\n"
             + (storyboard.narration_voice or "No narration."),
+            "Apply this exact narrator profile to every spoken shot: keep the same perceived "
+            "speaker, accent, age, pitch range, timbre, delivery, pace and recording character. "
+            "Do not reinterpret or vary the narrator between segments.",
         ]
         if shot.narration:
             lines.append("Speak exactly the following line, without additions or omissions. "
                          "Do not speak instructions or headings:\n" + shot.narration)
         else:
             lines.append("No dialogue, narration, extra voices or narration captions in this shot.")
+        if storyboard.music_mood:
+            lines.append("Whole-video music design (context only, do not read aloud):\n"
+                         + storyboard.music_mood)
+        lines.append(
+            f"Current music segment: {position} of {len(storyboard.shots)}. "
+            f"Planned position in the whole video: {shot.planned_start_seconds:g}–"
+            f"{shot.planned_end_seconds:g} seconds. Generate only this {seconds}-second segment; "
+            "do not generate the whole soundtrack or compress all segments into this clip. "
+            "Use the whole-video design to place this segment, not to add sounds from other shots. "
+            "The current shot's concrete music / sound-effect instructions take precedence; "
+            "if they specify no music or effects, do not add them from the whole-video design."
+        )
         lines.append("Music / sound effects for this shot (do not read aloud):\n"
                      + (shot.music_sfx or "No background music and no additional sound effects."))
         if shot.narration:
