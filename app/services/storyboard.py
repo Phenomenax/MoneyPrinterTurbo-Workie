@@ -375,10 +375,11 @@ def _voiceover_script(
     return script
 
 
-def parse_storyboard(path: str | Path, *, require_shot_timing: bool = False) -> Storyboard:
-    text, base_line = _load_text(path)
+def _parse_storyboard_text(
+    text: str, base_line: int, *, require_shot_timing: bool, native: bool = False
+) -> Storyboard:
     rows, _header_line = _beat_rows(text, base_line)
-    prompts, shots = _parse_shots(rows, require_shot_timing=require_shot_timing)
+    prompts, shots = _parse_shots(rows, require_shot_timing=require_shot_timing, native=native)
     script = _voiceover_script(
         text, base_line, shots, require_shot_timing=require_shot_timing
     )
@@ -397,12 +398,15 @@ def parse_storyboard(path: str | Path, *, require_shot_timing: bool = False) -> 
     )
 
 
+def parse_storyboard(path: str | Path, *, require_shot_timing: bool = False) -> Storyboard:
+    text, base_line = _load_text(path)
+    return _parse_storyboard_text(text, base_line, require_shot_timing=require_shot_timing)
+
+
 def parse_native_storyboard(path: str | Path) -> NativeStoryboard:
     """Opt-in audio fields; the legacy parser and its serialized shape stay intact."""
-    board = parse_storyboard(path, require_shot_timing=True)
     text, base_line = _load_text(path)
-    rows, _ = _beat_rows(text, base_line)
-    _, shots = _parse_shots(rows, require_shot_timing=True, native=True)
+    board = _parse_storyboard_text(text, base_line, require_shot_timing=True, native=True)
 
     def guidance(name):
         try:
@@ -422,7 +426,7 @@ def parse_native_storyboard(path: str | Path) -> NativeStoryboard:
 
     return NativeStoryboard(
         video_script=board.video_script, video_terms=board.video_terms,
-        aspect=board.aspect, title=board.title, shots=shots,
+        aspect=board.aspect, title=board.title, shots=board.shots,
         narration_voice=guidance("Narration voice"),
         captions_guidance=guidance("Captions guidance"),
         music_mood=music_mood,
