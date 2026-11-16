@@ -18,7 +18,7 @@ _QUOTE_PAIRS = (
     ("「", "」"),
     ("『", "』"),
 )
-_SILENCE_MARKERS = {"", "—", "-"}
+_SILENCE_MARKERS = {"", "—", "–", "-"}
 
 
 @dataclass(frozen=True)
@@ -100,15 +100,15 @@ def _require_filled(text: str, label: str) -> str:
 def _is_unfilled(text: str) -> bool:
     text = text.strip()
     return (
-        not text
-        or text in {"—", "-", "…", "..."}
+        _is_silence_marker(text)
+        or text in {"…", "..."}
         or re.search(r"<[^>]+>|\b(?:TODO|TBD|INSERT)\b", text, re.IGNORECASE) is not None
         or text.lower().startswith("just the spoken text")
     )
 
 
 def _is_silence_marker(text: str) -> bool:
-    return text.strip() in _SILENCE_MARKERS
+    return _strip_outer_quotes(text.strip()) in _SILENCE_MARKERS
 
 
 def _parse_clock(token: str) -> float:
@@ -380,9 +380,14 @@ def _parse_storyboard_text(
 ) -> Storyboard:
     rows, _header_line = _beat_rows(text, base_line)
     prompts, shots = _parse_shots(rows, require_shot_timing=require_shot_timing, native=native)
-    script = _voiceover_script(
-        text, base_line, shots, require_shot_timing=require_shot_timing
-    )
+    if native:
+        # The shot table is the only source of speech in native mode. Keep a
+        # derived full script for task records, ignoring legacy clean sections.
+        script = "\n".join(shot.narration for shot in shots if shot.narration)
+    else:
+        script = _voiceover_script(
+            text, base_line, shots, require_shot_timing=require_shot_timing
+        )
     aspect_match = re.search(r"\*\*Aspect(?::\*\*|\*\*:)\s*([^\s*]+)", text, re.IGNORECASE)
     aspect = aspect_match.group(1).strip() if aspect_match else None
     if aspect is not None and aspect not in {"16:9", "9:16", "1:1"}:

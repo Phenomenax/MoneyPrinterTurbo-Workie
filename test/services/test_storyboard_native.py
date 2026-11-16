@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -141,12 +142,53 @@ def test_missing_and_empty_guidance_fail_before_generation(board_path, section):
             parse_native_storyboard(board_path)
 
 
-def test_clean_narration_check_and_silent_board_are_preserved(board_path):
-    board_path.write_text(BOARD.replace("Beta line.\n\n##", "Different text.\n\n##"))
+def test_legacy_clean_narration_is_ignored_but_tts_still_checks_it(board_path):
+    board_path.write_text(BOARD.replace("Beta line.\n\n##", "Different text.\n\n##"), encoding="utf-8")
     with pytest.raises(ValueError, match="does not match"):
-        parse_native_storyboard(board_path)
+        parse_storyboard(board_path, require_shot_timing=True)
+    assert parse_native_storyboard(board_path).video_script == "Alpha line.\nBeta line."
+
+
+@pytest.mark.parametrize("clean", [None, "", "—", "Wrong dialogue.\n\n—"])
+def test_native_script_is_derived_only_from_shots(board_path, clean):
+    replacement = "" if clean is None else f"## Voiceover script (clean, ready to paste)\n{clean}\n\n"
+    text = re.sub(r"## Voiceover script[^\n]*\n.*?(?=## |\Z)", replacement, BOARD, flags=re.S)
+    text = text.replace("| Alpha line. |", "| Alpha line.<br><br>Another line. |")
+    board_path.write_text(text, encoding="utf-8")
+    board = parse_native_storyboard(board_path)
+    assert board.video_script == "Alpha line.\n\nAnother line.\nBeta line."
+    plans = native.build_generation_plan(board, run_config())
+    assert "Another line." in plans[0].prompt
+    assert "Wrong dialogue." not in "\n".join(plan.prompt for plan in plans)
+    assert "No dialogue" in plans[2].prompt
+
+
+@pytest.mark.parametrize("marker", ["-", "—", "–", " - ", '"-"', '" - "', "“—”", ""])
+def test_native_silence_markers_never_become_speech_or_sound(board_path, marker):
+    text = re.sub(r"## Voiceover script[^\n]*\n.*?(?=## |\Z)", "", BOARD, flags=re.S)
+    text = text.replace("| — | — |", f"| {marker} | {marker} |")
+    board_path.write_text(text, encoding="utf-8")
+    board = parse_native_storyboard(board_path)
+    assert board.shots[2].narration == ""
+    assert board.shots[2].music_sfx == ""
+    assert board.video_script == "Alpha line.\nBeta line."
+    plan = native.build_generation_plan(board, run_config())[2]
+    assert "No dialogue" in plan.prompt
+    assert "No background music and no additional sound effects" in plan.prompt
+    assert "Speak exactly" not in plan.prompt
+    assert "Generate captions" not in plan.prompt
+
+
+def test_native_preserves_hyphens_inside_real_dialogue(board_path):
+    board_path.write_text(BOARD.replace("Alpha line.", "A-B — still spoken."), encoding="utf-8")
+    board = parse_native_storyboard(board_path)
+    assert board.shots[0].narration == "A-B — still spoken."
+    assert board.video_script == "A-B — still spoken.\nBeta line."
+
+
+def test_fully_silent_native_board_needs_no_clean_section_or_voice_guidance(board_path):
     board_path.write_text(BOARD.replace("Alpha line.", "—").replace("Beta line.", "—")
-                          .replace("—\n—\n", "—\n").split("## Narration voice")[0])
+                          .split("## Voiceover script")[0], encoding="utf-8")
     board = parse_native_storyboard(board_path)
     assert board.video_script == ""
     assert all("No dialogue" in p.prompt for p in native.build_generation_plan(board, run_config()))
