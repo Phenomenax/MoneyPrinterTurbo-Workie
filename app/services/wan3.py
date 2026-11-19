@@ -16,14 +16,15 @@ from app.config import config
 from app.models.schema import MaterialInfo, VideoAspect
 from app.services import generation_progress
 from app.services import wan3_coordinator as coordinator
+from app.services.video_run_config import DEFAULT_CONCURRENCY, MAX_CONCURRENCY, WAN3
 from app.utils.request_logging import trace_http_call
 
 
 DEFAULT_MODEL_NAME = "wan3.0-video"
 MIN_CLIP_SECONDS = 2
 MAX_CLIP_SECONDS = 30
-DEFAULT_POLL_INTERVAL_SECONDS = 15.0
-DEFAULT_RUN_TIMEOUT_SECONDS = 1200.0
+DEFAULT_POLL_INTERVAL_SECONDS = 5.0
+DEFAULT_RUN_TIMEOUT_SECONDS = 1800.0
 MAX_POLL_RETRIES = 5
 RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 
@@ -47,14 +48,15 @@ class Wan3DownloadError(Wan3Error):
 def get_concurrency(run_config=None) -> int:
     if run_config is not None:
         return run_config.concurrency
-    value = config.app.get("wan3_concurrency", 5)
+    default = DEFAULT_CONCURRENCY[WAN3]
+    value = config.app.get("wan3_concurrency", default)
     if isinstance(value, bool):
-        return 5
+        return default
     try:
         parsed = int(str(value).strip())
     except (TypeError, ValueError, OverflowError):
-        return 5
-    return min(parsed, 5) if parsed >= 1 else 5
+        return default
+    return min(parsed, MAX_CONCURRENCY) if parsed >= 1 else default
 
 
 def get_api_key(settings: Mapping[str, Any] | None = None) -> str:

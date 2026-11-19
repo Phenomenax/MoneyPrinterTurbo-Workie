@@ -181,7 +181,7 @@ def test_fast_and_mini_reject_1080p_and_concurrency_is_bounded():
     assert vrc.resolve_video_run_config({**SEEDANCE_ENV, "MPT_SEEDANCE_CONCURRENCY": "5"}).concurrency == 5
     wan3 = vrc.resolve_video_run_config({**WAN3_ENV, "MPT_WAN3_RESOLUTION": "720p"})
     assert (wan3.resolution, wan3.min_duration, wan3.max_duration) == ("720P", 2, 30)
-    assert wan3.concurrency == 5
+    assert wan3.concurrency == 3
 
 
 def test_secrets_are_hidden_and_child_environment_overrides_aliases():

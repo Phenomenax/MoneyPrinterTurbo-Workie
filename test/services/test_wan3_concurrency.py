@@ -58,26 +58,26 @@ def _download(storyboard=False, count=6, **options):
 
 
 @pytest.mark.parametrize("value, expected", [
-    (1, 1), ("2", 2), (5, 5), (6, 5), (100, 5), (0, 5), (-1, 5),
-    (None, 5), (True, 5), (False, 5), ("bad", 5), ("", 5), (2.5, 5),
-    (float("nan"), 5), (float("inf"), 5),
+    (1, 1), ("2", 2), (5, 5), (6, 5), (100, 5), (0, 3), (-1, 3),
+    (None, 3), (True, 3), (False, 3), ("bad", 3), ("", 3), (2.5, 3),
+    (float("nan"), 3), (float("inf"), 3),
 ])
 def test_concurrency_config(monkeypatch, value, expected):
     monkeypatch.setitem(config.app, "wan3_concurrency", value)
     assert wan3.get_concurrency() == expected
 
 
-def test_missing_setting_defaults_to_five_without_writing_config(monkeypatch, tmp_path):
+def test_missing_setting_defaults_to_three_without_writing_config(monkeypatch, tmp_path):
     monkeypatch.delitem(config.app, "wan3_concurrency")
     target = tmp_path / "config.toml"
     target.write_text('[app]\nwan3_model_name = "my-model"\n')
     before = target.read_bytes()
-    assert wan3.get_concurrency() == 5
+    assert wan3.get_concurrency() == 3
     assert "wan3_concurrency" not in config.app and target.read_bytes() == before
 
 
 @pytest.mark.parametrize("storyboard", [False, True])
-def test_five_then_one_sliding_window_and_original_order(monkeypatch, storyboard):
+def test_three_then_one_sliding_window_and_original_order(monkeypatch, storyboard):
     monkeypatch.delitem(config.app, "wan3_concurrency")  # Exercise the upgraded default.
     started = [threading.Event() for _ in range(6)]
     finish = [threading.Event() for _ in range(6)]
@@ -117,11 +117,12 @@ def test_five_then_one_sliding_window_and_original_order(monkeypatch, storyboard
     with ThreadPoolExecutor(max_workers=1) as executor:
         result = executor.submit(run)
         try:
-            assert all(event.wait(3) for event in started[:5])
-            assert not started[5].is_set()
-            finish[3].set()  # Out-of-order completion opens exactly one slot.
-            assert started[5].wait(3)
-            for index in [5, 1, 4, 2, 0]:
+            assert all(event.wait(3) for event in started[:3])
+            assert not any(event.is_set() for event in started[3:])
+            finish[2].set()  # Out-of-order completion opens exactly one slot.
+            assert started[3].wait(3)
+            assert not any(event.is_set() for event in started[4:])
+            for index in [0, 4, 1, 5, 3]:
                 finish[index].set()
                 assert completed[index].wait(3)
             assert result.result(timeout=3) == [f"clip-{i}" for i in range(6)]
