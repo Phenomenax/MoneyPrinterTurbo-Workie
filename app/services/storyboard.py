@@ -49,6 +49,7 @@ class NativeStoryboard(Storyboard):
     narration_voice: str = ""
     captions_guidance: str = ""
     music_mood: str = ""
+    resolution: str | None = None
 
 
 def _section_match(text: str, name: str) -> re.Match[str]:
@@ -429,8 +430,17 @@ def parse_native_storyboard(path: str | Path) -> NativeStoryboard:
     if _is_silence_marker(music_mood):
         music_mood = ""
 
+    header = re.split(r"^##[ \t]+", text, maxsplit=1, flags=re.MULTILINE)[0]
+    resolutions = re.findall(
+        r"\*\*Resolution(?::\*\*|\*\*:)[ \t]*([^\r\n]*?)(?=[ \t]+\*\*|\r?$)",
+        header, flags=re.MULTILINE | re.IGNORECASE,
+    )
+    resolution = resolutions[0].strip().lower() if resolutions else None
+    if resolutions and (len(resolutions) != 1 or resolution not in {"480p", "720p", "1080p"}):
+        raise ValueError("storyboard Resolution must be a single 480p, 720p or 1080p value")
+
     return NativeStoryboard(
-        video_script=board.video_script, video_terms=board.video_terms,
+        resolution=resolution,        video_script=board.video_script, video_terms=board.video_terms,
         aspect=board.aspect, title=board.title, shots=board.shots,
         narration_voice=guidance("Narration voice"),
         captions_guidance=guidance("Captions guidance"),

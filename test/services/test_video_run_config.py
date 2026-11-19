@@ -28,7 +28,7 @@ def test_module_is_standard_library_only():
         for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names
     }
     assert imported <= {"__future__", "hashlib", "re", "collections", "dataclasses", "urllib"}
-    assert vrc.VIDEO_RUN_CONFIG_API_VERSION == 1
+    assert vrc.VIDEO_RUN_CONFIG_API_VERSION == 2
 
 
 @pytest.mark.parametrize("environ, reason, options", [

@@ -244,6 +244,9 @@ def start(
     if kwargs.get("storyboard_audio_mode", "tts") == "native":
         from app.services.storyboard_native import build_generation_plan
 
+        # Preserve the fingerprint written before Resolution was an optional header.
+        if getattr(storyboard_data, "resolution", None) is None:
+            inputs["storyboard"]["fields"].pop("resolution", None)
         inputs["storyboard_audio_mode"] = "native"
         inputs["native_requests"] = [
             [plan.prompt, plan.request_seconds]

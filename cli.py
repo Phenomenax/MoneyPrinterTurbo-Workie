@@ -1782,13 +1782,13 @@ def prepare_cli_files(params: VideoParams, stop_at: str) -> None:
         raise
 
 
-def _video_run_config_from_environment(source: str):
+def _video_run_config_from_environment(source: str, storyboard_resolution: str | None = None):
     """Freeze this process's environment selection once for the whole task."""
     from app.config import config
     from app.services import video_run_config as vrc
     from app.services import volcengine_seedance, wan3
 
-    resolved = vrc.resolve_video_run_config(dict(os.environ), source)
+    resolved = vrc.resolve_video_run_config(dict(os.environ), source, storyboard_resolution=storyboard_resolution)
     if isinstance(resolved, vrc.VideoInputRequired):
         raise ValueError(
             "environment video configuration is incomplete or invalid: "
@@ -1900,7 +1900,7 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
         params = build_video_params(args)
         prepare_cli_files(params, stop_at=args.stop_at)
         video_run_config = (
-            _video_run_config_from_environment(args.video_source)
+            _video_run_config_from_environment(args.video_source, getattr(args.storyboard_data, "resolution", None))
             if args.video_config_from_env else None
         )
         if args.storyboard_audio_mode == "native":

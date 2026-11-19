@@ -13,7 +13,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from urllib.parse import urlsplit, urlunsplit
 
-VIDEO_RUN_CONFIG_API_VERSION = 1
+VIDEO_RUN_CONFIG_API_VERSION = 2
 
 WAN3 = "wan3"
 SEEDANCE = "volcengine_seedance"
@@ -321,7 +321,7 @@ def _concurrency(raw: str, *, default: int) -> int | None:
     return value if 1 <= value <= MAX_CONCURRENCY else None
 
 
-def _resolve_source(environ: Mapping[str, str], source: str) -> VideoRunConfig | VideoInputRequired:
+def _resolve_source(environ: Mapping[str, str], source: str, storyboard_resolution: str | None) -> VideoRunConfig | VideoInputRequired:
     names = ENVIRONMENT_NAMES[source]
     missing: list[str] = []
     invalid: list[str] = []
@@ -369,20 +369,20 @@ def _resolve_source(environ: Mapping[str, str], source: str) -> VideoRunConfig |
         elif model:
             missing.append(names["family"])
 
-    raw_resolution = _value(environ, names["resolution"])
-    resolution = ""
-    if source == WAN3:
-        resolution = raw_resolution.upper() or WAN3_FAMILY.default_resolution
-        if resolution not in WAN3_FAMILY.resolutions:
+    raw_resolution = storyboard_resolution or _value(environ, names["resolution"])
+    resolution = raw_resolution.upper() if source == WAN3 else raw_resolution.lower()
+    if family is not None:
+        resolution = resolution or family.default_resolution
+        if resolution not in family.resolutions:
+            if storyboard_resolution and _valid_text(model):
+                available = " / ".join(value.lower() for value in family.resolutions)
+                raise ValueError(
+                    f"模型 {model}（{family.name}）不支持所选分辨率 {resolution}，"
+                    f"可用档位为 {available}。请在聊天中明确改选。"
+                )
             invalid.append(names["resolution"])
-    else:
-        resolution = raw_resolution.lower()
-        if family is not None:
-            resolution = resolution or family.default_resolution
-            if resolution not in family.resolutions:
-                invalid.append(names["resolution"])
-        elif resolution and resolution not in _SEEDANCE_RESOLUTIONS:
-            invalid.append(names["resolution"])
+    elif resolution and resolution not in _SEEDANCE_RESOLUTIONS:
+        invalid.append(names["resolution"])
 
     concurrency = _concurrency(
         _value(environ, names["concurrency"]), default=DEFAULT_CONCURRENCY[source],
@@ -415,6 +415,7 @@ def _resolve_source(environ: Mapping[str, str], source: str) -> VideoRunConfig |
 def resolve_video_run_config(
     environ: Mapping[str, str],
     requested_source: str | None = None,
+    *, storyboard_resolution: str | None = None,
 ) -> VideoRunConfig | VideoInputRequired:
     """Select a provider by non-empty keys, then validate only the selection.
 
@@ -425,10 +426,10 @@ def resolve_video_run_config(
         requested_source = str(requested_source).strip().lower()
         if requested_source not in SOURCES:
             raise ValueError(f"unsupported environment video source: {requested_source!r}")
-        return _resolve_source(environ, requested_source)
+        return _resolve_source(environ, requested_source, storyboard_resolution)
     candidates = detected_sources(environ)
     if not candidates:
         return VideoInputRequired(REASON_NO_VIDEO_KEY, options=SOURCES)
     if len(candidates) > 1:
         return VideoInputRequired(REASON_MULTIPLE_VIDEO_KEYS, options=candidates)
-    return _resolve_source(environ, candidates[0])
+    return _resolve_source(environ, candidates[0], storyboard_resolution)

@@ -230,8 +230,54 @@ def test_cli_defaults_stay_tts_and_saved_audio_resources_do_not_apply(board_path
     assert not params.subtitle_enabled and not params.custom_audio_file
 
 
+@pytest.mark.parametrize("source, prefix, model, expected", [
+    ("wan3", "WAN3", "wan3.0-video", "720P"),
+    ("volcengine_seedance", "SEEDANCE", "doubao-seedance-2-0-mini", "720p"),
+])
+def test_storyboard_resolution_reaches_native_payload(board_path, monkeypatch, source, prefix, model, expected):
+    for name, value in {"API_KEY": "test", "BASE_URL": "https://gateway.invalid",
+                        "MODEL_NAME": model, "RESOLUTION": "480p"}.items():
+        monkeypatch.setenv(f"MPT_{prefix}_{name}", value)
+    old_board = parse_native_storyboard(board_path)
+    assert old_board.resolution is None
+    assert cli._video_run_config_from_environment(source, old_board.resolution).resolution.lower() == "480p"
+    board_path.write_text(BOARD.replace("**Aspect:** 16:9", "**Aspect:** 16:9\n**Resolution:** 720p"), encoding="utf-8")
+    board = parse_native_storyboard(board_path)
+    resolved = native.audio_run_config(cli._video_run_config_from_environment(source, board.resolution))
+    if source == "wan3":
+        created = {"output": {"task_id": "local-id"}}
+        finished = {"output": {"task_status": "SUCCEEDED", "video_url": "https://media.invalid/test.mp4"}}
+    else:
+        created = {"id": "local-id"}
+        finished = {"id": "local-id", "status": "succeeded", "content": {"video_url": "https://media.invalid/test.mp4"}}
+    post = Mock(return_value=SimpleNamespace(status_code=200, headers={}, json=lambda: created))
+    monkeypatch.setattr(wan3.requests, "post", post)
+    monkeypatch.setattr(wan3.requests, "get", lambda *a, **kw: SimpleNamespace(status_code=200, headers={}, json=lambda: finished))
+    if source == "wan3":
+        wan3.generate_videos("prompt", 4, "16:9", run_config=resolved)
+        params = post.call_args.kwargs["json"]["parameters"]
+    else:
+        seedance.generate_videos("prompt", 4, "16:9", endpoint=seedance.endpoint_from_run_config(resolved))
+        params = post.call_args.kwargs["json"]
+    assert params["resolution"] == expected
+
+
+def test_cli_rejects_mini_1080p_before_submission(board_path, monkeypatch, capsys):
+    board_path.write_text(BOARD.replace("**Aspect:** 16:9", "**Aspect:** 16:9\n**Resolution:** 1080p"), encoding="utf-8")
+    for name, value in {"API_KEY": "test", "BASE_URL": "https://gateway.invalid",
+                        "MODEL_NAME": "doubao-seedance-2-0-mini"}.items():
+        monkeypatch.setenv(f"MPT_SEEDANCE_{name}", value)
+    args = native_argv(board_path, "--confirm-seedance-charge")
+    args[args.index("wan3")] = "volcengine_seedance"
+    assert cli.run_cli(args) == 2
+    output = capsys.readouterr()
+    assert "doubao-seedance-2-0-mini" in output.out + output.err
+    assert "480p / 720p" in output.out + output.err
+    wan3.requests.post.assert_not_called()
+
+
 def test_cli_preflight_rejects_model_limits_before_task_start(board_path, monkeypatch):
-    monkeypatch.setattr(cli, "_video_run_config_from_environment", lambda source: run_config(max_duration=4))
+    monkeypatch.setattr(cli, "_video_run_config_from_environment", lambda source, resolution: run_config(max_duration=4))
     start = Mock(side_effect=AssertionError("must fail before starting a task"))
     monkeypatch.setattr(task, "start", start)
     assert cli.run_cli(native_argv(board_path)) == 2
@@ -321,15 +367,25 @@ def test_api_rejection_stops_dispatch_and_keeps_previous_download_and_remote_ids
     assert checkpoint["clips"]["3"]["status"] == "pending"
 
 
-def make_clip(target, duration, color="red", frequency=440, audio=True, silence=False):
+def make_clip(target, duration, color="red", frequency=440, audio=True, silence=False, size="160x90"):
     command = [utils.get_ffmpeg_binary(), "-y", "-v", "error", "-f", "lavfi", "-i",
-               f"color=c={color}:s=160x90:r=30:d={duration}"]
+               f"color=c={color}:s={size}:r=30:d={duration}"]
     if audio:
         source = f"anullsrc=r=48000:cl=mono:d={duration}" if silence else f"sine=frequency={frequency}:sample_rate=48000:duration={duration}"
         command += ["-f", "lavfi", "-i", source, "-c:a", "pcm_s16le"]
     command += ["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", str(target)]
     subprocess.run(command, check=True, capture_output=True)
     return str(target)
+
+
+def test_native_landscape_720p_material_exports_full_hd(tmp_path):
+    clip = make_clip(tmp_path / "720p.mkv", 0.5, size="1280x720")
+    output = tmp_path / "final.mp4"
+    native.render_native([clip], [native.NativeShotPlan(1, "prompt", 4, 4)],
+                         str(output), aspect="16:9")
+    with av.open(str(output)) as media:
+        stream = media.streams.video[0]
+        assert (stream.width, stream.height) == (1920, 1080)
 
 
 def audio_samples(filename):
@@ -518,6 +574,15 @@ def test_legacy_checkpoint_identity_is_unchanged_and_native_inputs_are_fenced(tm
     options = dict(task_id="new", params=params, storyboard_data=parse_native_storyboard(board_path),
                    video_run_config=run_config(), storyboard_audio_mode="native")
     cp.start(**options)
+    old_board = cp._pack(options["storyboard_data"])
+    del old_board["fields"]["resolution"]
+    plans = native.build_generation_plan(options["storyboard_data"], options["video_run_config"])
+    old_identity = cp.fingerprint({"params": params.model_dump(), "storyboard": old_board,
+                                   "video": options["video_run_config"].summary(), "storyboard_audio_mode": "native",
+                                   "native_requests": [[plan.prompt, plan.request_seconds] for plan in plans]})
+    checkpoint = json.loads((Path(utils.task_dir("new")) / "storyboard-checkpoint.json").read_text())
+    assert checkpoint["identity"] == old_identity
+    cp.start(**options, resume=True)
     changed = replace(options["storyboard_data"], narration_voice="A different voice")
     with pytest.raises(cp.CheckpointError, match="inputs changed"):
         cp.start(**(options | {"storyboard_data": changed}), resume=True)
