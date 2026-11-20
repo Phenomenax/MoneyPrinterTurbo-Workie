@@ -19,6 +19,7 @@ WAN3 = "wan3"
 SEEDANCE = "volcengine_seedance"
 SOURCES = (WAN3, SEEDANCE)
 SOURCE_LABELS = {WAN3: "Wan3", SEEDANCE: "Seedance兼容网关"}
+TARGET_MAX_SHOT_SECONDS_ENV = "MPT_TARGET_MAX_SHOT_SECONDS"
 
 ENVIRONMENT_NAMES = {
     WAN3: {
@@ -433,3 +434,37 @@ def resolve_video_run_config(
     if len(candidates) > 1:
         return VideoInputRequired(REASON_MULTIPLE_VIDEO_KEYS, options=candidates)
     return _resolve_source(environ, candidates[0], storyboard_resolution)
+
+
+def resolve_target_max_shot_seconds(
+    environ: Mapping[str, str], *, min_duration: int, max_duration: int,
+) -> int:
+    """Return a planning cap inside the model range, or the hard maximum."""
+    raw = _value(environ, TARGET_MAX_SHOT_SECONDS_ENV)
+    if not re.fullmatch(r"\d+", raw):
+        return max_duration
+    value = int(raw)
+    if value <= 0:
+        return max_duration
+    return max(min_duration, min(value, max_duration))
+
+
+def resolve_shot_planning_bounds(
+    environ: Mapping[str, str], requested_source: str | None = None,
+) -> dict[str, object] | None:
+    """Non-sensitive duration bounds, including an optional soft cap."""
+    result = resolve_video_run_config(environ, requested_source)
+    if not isinstance(result, VideoRunConfig):
+        return None
+    target_max = resolve_target_max_shot_seconds(
+        environ, min_duration=result.min_duration, max_duration=result.max_duration,
+    )
+    return {
+        "source": result.source,
+        "model": result.model,
+        "model_family": result.model_family,
+        "min_duration": result.min_duration,
+        "max_duration": result.max_duration,
+        "target_max_duration": target_max,
+        "soft_cap_applied": target_max < result.max_duration,
+    }

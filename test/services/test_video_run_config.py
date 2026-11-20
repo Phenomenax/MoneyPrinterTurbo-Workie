@@ -227,3 +227,59 @@ def test_wan3_bounds_match_provider_module():
 def test_unknown_requested_source_is_a_programming_error():
     with pytest.raises(ValueError):
         vrc.resolve_video_run_config({}, "pexels")
+
+
+def test_unset_target_max_uses_model_hard_maximum():
+    assert vrc.resolve_target_max_shot_seconds({}, min_duration=2, max_duration=30) == 30
+    bounds = vrc.resolve_shot_planning_bounds(
+        {**WAN3_ENV, "MPT_WAN3_MODEL_NAME": "wan3-video"})
+    assert bounds["target_max_duration"] == bounds["max_duration"] == 30
+    assert bounds["min_duration"] == 2
+    assert bounds["soft_cap_applied"] is False
+    assert bounds["model"] == "wan3-video"
+    assert "api_key" not in bounds and "endpoint" not in bounds and "proxies" not in bounds
+    assert "wan3-secret" not in str(bounds)
+
+
+def test_soft_cap_narrows_wan3_without_changing_hard_maximum():
+    environ = {**WAN3_ENV, "MPT_WAN3_MODEL_NAME": "wan3-video",
+               vrc.TARGET_MAX_SHOT_SECONDS_ENV: "15"}
+    bounds = vrc.resolve_shot_planning_bounds(environ)
+    assert (bounds["source"], bounds["model"], bounds["model_family"]) == ("wan3", "wan3-video", "wan3")
+    assert (bounds["min_duration"], bounds["max_duration"], bounds["target_max_duration"]) == (2, 30, 15)
+    assert bounds["soft_cap_applied"] is True
+    assert "wan3-secret" not in str(bounds)
+
+
+def test_soft_cap_above_seedance_hard_max_is_not_applied():
+    environ = {**SEEDANCE_ENV, "MPT_SEEDANCE_MODEL_NAME": "doubao-seedance-2-0-260128",
+               vrc.TARGET_MAX_SHOT_SECONDS_ENV: "25"}
+    bounds = vrc.resolve_shot_planning_bounds(environ)
+    assert bounds["model_family"] == "seedance-2.0"
+    assert (bounds["min_duration"], bounds["max_duration"], bounds["target_max_duration"]) == (4, 15, 15)
+    assert bounds["soft_cap_applied"] is False
+    assert "gateway-secret" not in str(bounds)
+
+
+def test_soft_cap_below_minimum_is_clamped_up():
+    environ = {**SEEDANCE_ENV, "MPT_SEEDANCE_MODEL_NAME": "doubao-seedance-2-0-260128",
+               vrc.TARGET_MAX_SHOT_SECONDS_ENV: "1"}
+    bounds = vrc.resolve_shot_planning_bounds(environ)
+    assert (bounds["min_duration"], bounds["max_duration"], bounds["target_max_duration"]) == (4, 15, 4)
+    assert bounds["soft_cap_applied"] is True
+
+
+@pytest.mark.parametrize("raw", ["", "   ", "0", "-1", "15.5", "abc", "15s"])
+def test_invalid_target_max_is_ignored(raw):
+    assert vrc.resolve_target_max_shot_seconds(
+        {vrc.TARGET_MAX_SHOT_SECONDS_ENV: raw}, min_duration=4, max_duration=15,
+    ) == 15
+    bounds = vrc.resolve_shot_planning_bounds({**WAN3_ENV, vrc.TARGET_MAX_SHOT_SECONDS_ENV: raw})
+    assert bounds["target_max_duration"] == bounds["max_duration"]
+    assert bounds["soft_cap_applied"] is False
+
+
+def test_missing_or_multiple_video_keys_have_no_planning_bounds():
+    assert vrc.resolve_shot_planning_bounds({}) is None
+    assert vrc.resolve_shot_planning_bounds({}, "wan3") is None
+    assert vrc.resolve_shot_planning_bounds({**WAN3_ENV, **SEEDANCE_ENV}) is None
