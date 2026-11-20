@@ -50,6 +50,7 @@ class NativeStoryboard(Storyboard):
     captions_guidance: str = ""
     music_mood: str = ""
     resolution: str | None = None
+    visual_continuity: str = ""
 
 
 def _section_match(text: str, name: str) -> re.Match[str]:
@@ -430,6 +431,13 @@ def parse_native_storyboard(path: str | Path) -> NativeStoryboard:
     if _is_silence_marker(music_mood):
         music_mood = ""
 
+    try:
+        visual_continuity = _section(text, "Visual continuity")
+    except ValueError:
+        visual_continuity = ""
+    if _is_silence_marker(visual_continuity):
+        visual_continuity = ""
+
     header = re.split(r"^##[ \t]+", text, maxsplit=1, flags=re.MULTILINE)[0]
     resolutions = re.findall(
         r"\*\*Resolution(?::\*\*|\*\*:)[ \t]*([^\r\n]*?)(?=[ \t]+\*\*|\r?$)",
@@ -445,4 +453,5 @@ def parse_native_storyboard(path: str | Path) -> NativeStoryboard:
         narration_voice=guidance("Narration voice"),
         captions_guidance=guidance("Captions guidance"),
         music_mood=music_mood,
+        visual_continuity=visual_continuity,
     )

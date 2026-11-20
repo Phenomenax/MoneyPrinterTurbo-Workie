@@ -672,3 +672,42 @@ def test_legacy_checkpoint_identity_is_unchanged_and_native_inputs_are_fenced(tm
     changed_music = replace(options["storyboard_data"], music_mood="A new whole-video score")
     with pytest.raises(cp.CheckpointError, match="inputs changed"):
         cp.start(**(options | {"storyboard_data": changed_music}), resume=True)
+
+
+def test_visual_continuity_is_injected_once_before_each_shot_description(board_path):
+    anchor = "Same barista in a navy apron.\nOak counter, warm tungsten light, no wardrobe changes."
+    board_path.write_text(BOARD + "\n## Visual continuity\n" + anchor + "\n", encoding="utf-8")
+    board = parse_native_storyboard(board_path)
+    assert board.visual_continuity == anchor
+    plans = native.build_generation_plan(board, run_config())
+    block = (
+        "Whole-video visual continuity anchor (apply consistently across every shot; "
+        "do not alter recurring subject appearance, clothing, core objects, primary "
+        "setting layout, lighting, color palette or rendering style unless the shot "
+        "description explicitly specifies a change):\n"
+        + anchor
+    )
+    for plan in plans:
+        assert plan.prompt.count(block) == 1
+        assert plan.prompt.index(block) < plan.prompt.index("Shot type and visual description:")
+        assert f"{block}\n\nShot type and visual description:\n" in plan.prompt
+
+
+@pytest.mark.parametrize("section", ["", "\n## Visual continuity\n\n", "\n## Visual continuity\n—\n"])
+def test_missing_or_empty_visual_continuity_adds_no_anchor(board_path, section):
+    board_path.write_text(BOARD + section, encoding="utf-8")
+    board = parse_native_storyboard(board_path)
+    assert board.visual_continuity == ""
+    plans = native.build_generation_plan(board, run_config())
+    assert all("Whole-video visual continuity anchor" not in plan.prompt for plan in plans)
+
+
+def test_visual_continuity_changes_revision_request_hash(board_path):
+    from app.services import storyboard_revision as revision
+
+    config = native.audio_run_config(run_config())
+    board_path.write_text(BOARD + "\n## Visual continuity\nSame red coat.\n", encoding="utf-8")
+    first = native.build_generation_plan(parse_native_storyboard(board_path), config)[0]
+    board_path.write_text(BOARD + "\n## Visual continuity\nSame blue coat.\n", encoding="utf-8")
+    second = native.build_generation_plan(parse_native_storyboard(board_path), config)[0]
+    assert revision.request_hash(first, config, "16:9") != revision.request_hash(second, config, "16:9")

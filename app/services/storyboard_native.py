@@ -89,6 +89,7 @@ def build_generation_plan(storyboard, run_config):
         raise NativeStoryboardError("native storyboard has no timed shots")
     if not hasattr(storyboard, "narration_voice") or not hasattr(storyboard, "captions_guidance"):
         raise NativeStoryboardError("native storyboard must use parse_native_storyboard")
+    visual_continuity = (getattr(storyboard, "visual_continuity", "") or "").strip()
     plans = []
     for position, shot in enumerate(storyboard.shots, start=1):
         milliseconds = round(shot.planned_end_seconds * 1000) - round(shot.planned_start_seconds * 1000)
@@ -104,6 +105,16 @@ def build_generation_plan(storyboard, run_config):
             raise NativeStoryboardError("spoken shots require Narration voice and Captions guidance", shot=shot.index)
         lines = [
             "Generate this single self-contained shot with synchronized video and native audio.",
+        ]
+        if visual_continuity:
+            lines.append(
+                "Whole-video visual continuity anchor (apply consistently across every shot; "
+                "do not alter recurring subject appearance, clothing, core objects, primary "
+                "setting layout, lighting, color palette or rendering style unless the shot "
+                "description explicitly specifies a change):\n"
+                + visual_continuity
+            )
+        lines.extend([
             "Shot type and visual description:\n" + shot.prompt,
             f"Requested duration: {seconds} seconds. Keep the first and last 0.2 seconds free "
             "of narration or dialogue; finish the spoken line between these margins. "
@@ -113,7 +124,7 @@ def build_generation_plan(storyboard, run_config):
             "Apply this exact narrator profile to every spoken shot: keep the same perceived "
             "speaker, accent, age, pitch range, timbre, delivery, pace and recording character. "
             "Do not reinterpret or vary the narrator between segments.",
-        ]
+        ])
         if shot.narration:
             lines.append("Speak exactly the following line, without additions or omissions. "
                          "Do not speak instructions or headings:\n" + shot.narration)
