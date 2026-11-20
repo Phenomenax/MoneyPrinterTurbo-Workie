@@ -214,16 +214,8 @@ def generate_videos(
         "Content-Type": "application/json",
         "X-DashScope-Async": "enable",
     }
-    payload = {
-        "model": model,
-        "input": {"prompt": term},
-        "parameters": {
-            "resolution": resolution,
-            "ratio": aspect.value,
-            "duration": minimum_duration,
-            "audio": bool(run_config is not None and run_config.generate_audio),
-        },
-    }
+    payload = video_payload(model, resolution, aspect, term, minimum_duration,
+                            bool(run_config is not None and run_config.generate_audio))
     try:
         slot = coordinator.acquire_slot(
             base_url=base_url,
@@ -243,6 +235,12 @@ def generate_videos(
                 slot.complete()
         finally:
             slot.close()
+
+
+def video_payload(model, resolution, aspect, prompt, seconds, audio):
+    return {"model": model, "input": {"prompt": prompt},
+            "parameters": {"resolution": resolution, "ratio": aspect.value,
+                           "duration": seconds, "audio": audio}}
 
 
 def _submit_and_wait(slot, payload, base_url, headers, api_key,

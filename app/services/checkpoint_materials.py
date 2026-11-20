@@ -55,6 +55,8 @@ def prepare(requests, run_config, material_directory):
             if checkpoint.valid(record, artifact_roots=artifact_roots):
                 cached[index] = checkpoints._unpack(record["items"])
                 continue
+            if record.get("reused"):
+                raise checkpoints.CheckpointError(f"reused shot {plan.index} changed; repeat revision preflight")
             if not checkpoint.allow_rebuild:
                 raise checkpoints.CheckpointError(
                     f"saved shot {plan.index} is missing or damaged; explicit rebuild approval required"

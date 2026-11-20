@@ -229,7 +229,7 @@ def run(stage, operation):
 
 
 def start(
-    *, task_id, params, storyboard_data, resume=False, allow_rebuild=False, **kwargs
+    *, task_id, params, storyboard_data, resume=False, allow_rebuild=False, revision_plan=None, **kwargs
 ):
     from app.services import task
     from app.utils import utils
@@ -252,6 +252,10 @@ def start(
             [plan.prompt, plan.request_seconds]
             for plan in build_generation_plan(storyboard_data, kwargs.get("video_run_config"))
         ]
+    if revision_plan is not None:
+        if Path(task_id) == Path(revision_plan["source"]["task_id"]):
+            raise ValueError("修改任务需要单独的任务编号。")
+        inputs["revision_plan"] = revision_plan
     identity = fingerprint(inputs)
     with scope(
         utils.task_dir(task_id),
@@ -259,7 +263,12 @@ def start(
         enabled=True,
         resume=resume,
         allow_rebuild=allow_rebuild,
-    ):
+    ) as checkpoint:
+        if revision_plan is not None:
+            from app.services.storyboard_revision import stage_revision
+
+            stage_revision(checkpoint, revision_plan, storyboard_data,
+                           kwargs["video_run_config"], params.video_aspect)
         return task.start(
             task_id=task_id, params=params, storyboard_data=storyboard_data, **kwargs
         )

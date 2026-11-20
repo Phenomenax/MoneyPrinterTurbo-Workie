@@ -214,9 +214,11 @@ def render_native(clips, plans, output_file, *, aspect, threads=2, fit_mode="cov
     root.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="native-render-", dir=root) as temporary:
         normalized = []
+        frame_counts = []
         for index, (clip, info) in enumerate(zip(clips, media_info, strict=True)):
             duration = info["duration"]
             frames = max(1, math.ceil(duration * FPS - 1e-7))
+            frame_counts.append(frames)
             padded_seconds = frames / FPS
             samples = frames * (SAMPLE_RATE // FPS)
             fade = min(FADE_SECONDS, duration / 2)
@@ -256,7 +258,7 @@ def render_native(clips, plans, output_file, *, aspect, threads=2, fit_mode="cov
         os.replace(staged, output_file)
     return {"videos": [str(Path(output_file).resolve())], "combined_videos": [],
             "actual_seconds": [info["duration"] for info in media_info],
-            "output_seconds": final_info["duration"]}
+            "frame_counts": frame_counts, "output_seconds": final_info["duration"]}
 
 
 def run(task_id, params, storyboard, run_config, *, stop_at="video", explicit_clip_duration=None):
@@ -308,6 +310,11 @@ def run(task_id, params, storyboard, run_config, *, stop_at="video", explicit_cl
             clips, plans, str(Path(utils.task_dir(task_id)) / "final-1.mp4"),
             aspect=params.video_aspect, threads=params.n_threads, fit_mode=params.video_fit_mode,
         ))
+        if rendered.get("frame_counts"):
+            from app.services.storyboard_revision import publish_manifest
+
+            publish_manifest(Path(utils.task_dir(task_id)), rendered, clips, plans,
+                             audio_config, params.video_aspect)
         for plan, actual in zip(plans, rendered["actual_seconds"], strict=True):
             plan.material_seconds = actual
         diagnostics()

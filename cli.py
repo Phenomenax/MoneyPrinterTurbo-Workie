@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import sys
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Sequence
 from uuid import UUID, uuid4
 
@@ -748,6 +749,8 @@ Batch manifests:
             "generates a UUID for every task"
         ),
     )
+    parser.add_argument("--revision-plan", type=Path, help="frozen native storyboard revision plan")
+    parser.add_argument("--revision-plan-sha256", help="expected digest of the authorized revision plan")
     parser.add_argument("--storyboard-checkpoint", action="store_true", help="save resumable storyboard checkpoints")
     parser.add_argument("--resume-storyboard", action="store_true", help="resume the same checkpointed task, never an unknown submission")
     parser.add_argument("--allow-checkpoint-rebuild", action="store_true", help="explicitly approve rebuilding missing or damaged checkpoint files")
@@ -761,6 +764,8 @@ Batch manifests:
             validate_native_arguments(list(sys.argv[1:] if argv is None else argv))
         except ValueError as exc:
             parser.error(str(exc))
+    if args.revision_plan and (args.storyboard_audio_mode != "native" or not args.storyboard_checkpoint):
+        parser.error("--revision-plan requires native audio and --storyboard-checkpoint")
     if args.storyboard_checkpoint or args.resume_storyboard or args.allow_checkpoint_rebuild:
         if not args.storyboard or not args.task_id or args.batch_file:
             parser.error("storyboard checkpoints require --storyboard and --task-id for a single task")
@@ -1935,6 +1940,13 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
             entrypoint = checkpoint_start
             checkpoint_options = {"resume": args.resume_storyboard,
                                   "allow_rebuild": args.allow_checkpoint_rebuild}
+            if args.revision_plan:
+                import hashlib
+
+                frozen = args.revision_plan.read_bytes()
+                if not args.revision_plan_sha256 or hashlib.sha256(frozen).hexdigest() != args.revision_plan_sha256:
+                    raise ValueError("修改方案与已授权的摘要不一致，请重新预检。")
+                checkpoint_options["revision_plan"] = json.loads(frozen)
         result = entrypoint(
             task_id=task_id,
             params=params,

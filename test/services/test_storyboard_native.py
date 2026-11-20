@@ -378,6 +378,89 @@ def make_clip(target, duration, color="red", frequency=440, audio=True, silence=
     return str(target)
 
 
+@pytest.mark.parametrize("provider", ["wan3", "volcengine_seedance"])
+def test_five_shot_revision_pins_four_clips_and_resumes_without_submitting_again(tmp_path, monkeypatch, provider):
+    from app.services import storyboard_revision as revision
+
+    monkeypatch.setattr(VideoAspect, "to_resolution", lambda self: (160, 90))
+    board_path = tmp_path / "board.md"
+    rows = "\n".join(f"| {4*i}–{4*i+4} | Wide | Coffee {i} | — | — |" for i in range(5))
+    board_path.write_text(BOARD[:BOARD.index("| 0–")] + rows + "\n", encoding="utf-8")
+    board = parse_native_storyboard(board_path)
+    saved = Path(utils.storage_dir("cache_videos", create=True))
+    calls = []
+
+    def generate(**kwargs):
+        calls.append(kwargs["prompt"])
+        remote = f"paid-{len(calls)}"
+        kwargs["on_task_created"](remote)
+        path = make_clip(saved / f"{remote}.mkv", 0.2, frequency=400 + len(calls)*20)
+        return [(path, 0.2, {}, remote)]
+
+    monkeypatch.setattr(material, "_generate_wan3_materials", generate)
+    if provider == "volcengine_seedance":
+        def generate_seedance(prompt, _seconds, _aspect, **kwargs):
+            path, _, _, remote = generate(prompt=prompt, on_task_created=kwargs["on_task_created"])[0]
+            return MaterialInfo(provider=provider, url=path, source_info={"asset_id": remote})
+        monkeypatch.setattr(seedance, "generate_coordinated_clip", generate_seedance)
+        monkeypatch.setattr(material, "_save_generated_video_with_retry", lambda url, *args, **kwargs: url)
+    config = run_config(provider)
+    options = dict(params=VideoParams(video_subject="Coffee", video_source=provider, video_aspect="16:9"),
+                   storyboard_data=board, video_run_config=config, storyboard_audio_mode="native")
+    parent = cp.start(task_id="parent", **options)
+    root = Path(utils.task_dir("parent"))
+    original = json.loads((root / revision.MANIFEST).read_text())
+    source = dict(task_id="parent", final_sha256=cp.digest(parent["videos"][0]))
+    assert len(calls) == 5
+    assert [r["start_frame"] for r in original["shots"]] == [0, 6, 12, 18, 24]
+    board_path.write_text(board_path.read_text(encoding="utf-8").replace("Coffee 2", "Overhead pour"), encoding="utf-8")
+    options["storyboard_data"] = board = parse_native_storyboard(board_path)
+    plan, _ = revision.preflight(root.parent, source, board, config, "16:9", "partial", [3])
+    assert [r["action"] for r in plan["shots"]] == ["reuse", "reuse", "generate", "reuse", "reuse"]
+    with pytest.raises(ValueError, match="重新预检"):
+        cp.start(task_id="drift", revision_plan=plan, **{**options, "video_run_config": replace(config, model="changed")})
+    assert len(calls) == 5
+    child = cp.start(task_id="child", revision_plan=plan, **options)
+    assert len(calls) == 6 and "Overhead pour" in calls[-1]
+    assert native.inspect_clip(child["videos"][0])["duration"] > 0
+    updated = json.loads((root.parent / "child" / revision.MANIFEST).read_text())
+    assert [a["sha256"] == b["sha256"] for a, b in zip(original["shots"], updated["shots"])] == [True, True, False, True, True]
+    assert cp.start(task_id="child", revision_plan=plan, resume=True, **options)["videos"] == child["videos"]
+    assert len(calls) == 6 and cp.digest(parent["videos"][0]) == source["final_sha256"]
+    child_source = dict(task_id="child", final_sha256=updated["final_sha256"])
+    resample, _ = revision.preflight(root.parent, child_source, board, config, "16:9", "partial", [3])
+    assert resample["shots"][2]["reason"] == "requested"
+    third = cp.start(task_id="third", revision_plan=resample, **options)
+    assert third["videos"] and len(calls) == 7
+    assert cp.digest(child["videos"][0]) == child_source["final_sha256"]
+    missing = root / original["shots"][0]["path"]
+    original_bytes = missing.read_bytes()
+    missing.unlink()
+    lookup = Mock(side_effect=wan3.Wan3DownloadError("expired", task_id="paid-1"))
+    monkeypatch.setattr(wan3 if provider == "wan3" else seedance, "recover_video", lookup)
+    changed, _ = revision.preflight(root.parent, source, board, config, "16:9", "partial", [3])
+    assert changed["shots"][0]["reason"] == "missing_material" and lookup.call_count == 1
+    with pytest.raises(ValueError, match="重新预检"):
+        cp.start(task_id="stale", revision_plan=plan, **options)
+    assert len(calls) == 7
+    lookup.side_effect = None
+    lookup.return_value = MaterialInfo(provider="wan3", url="https://media.invalid/1")
+    def recover(_url, directory, _provider, **_):
+        recovered = Path(directory) / "recovered.mkv"
+        recovered.write_bytes(original_bytes)
+        return str(recovered)
+    with monkeypatch.context() as recovery:
+        recovery.setattr(material, "_save_generated_video_with_retry", recover)
+        recovered, _ = revision.preflight(root.parent, source, board, config, "16:9", "partial", [3])
+    assert recovered == plan and not missing.exists()
+    (root / revision.MANIFEST).unlink()
+    with pytest.raises(ValueError, match="整片重做"):
+        revision.preflight(root.parent, source, board, config, "16:9", "partial", [3])
+    full, _ = revision.preflight(root.parent, source, board, config, "16:9", "full", [])
+    assert cp.start(task_id="legacy-full", revision_plan=full, **options)["videos"]
+    assert len(calls) == 12 and cp.digest(parent["videos"][0]) == source["final_sha256"]
+
+
 def test_native_landscape_720p_material_exports_full_hd(tmp_path):
     clip = make_clip(tmp_path / "720p.mkv", 0.5, size="1280x720")
     output = tmp_path / "final.mp4"
