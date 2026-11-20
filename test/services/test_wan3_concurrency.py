@@ -566,3 +566,45 @@ os._exit(0)
         slot = coordinator.acquire_slot(base_url="base", probe=lambda _id: True)
         slot.complete()
         slot.close()
+
+
+def test_atomic_json_retries_transient_windows_access_denied(monkeypatch, tmp_path):
+    target = tmp_path / "storyboard-checkpoint.json"
+    real_replace = os.replace
+    attempts = []
+    sleeps = []
+
+    def flaky_replace(source, destination):
+        attempts.append((source, destination))
+        if len(attempts) < 3:
+            raise PermissionError(13, "Access is denied", str(source), 5, str(destination))
+        real_replace(source, destination)
+
+    monkeypatch.setattr(coordinator.os, "name", "nt")
+    monkeypatch.setattr(coordinator.os, "replace", flaky_replace)
+    monkeypatch.setattr(coordinator.time, "sleep", sleeps.append)
+
+    coordinator.atomic_json(target, {"ok": True})
+    assert json.loads(target.read_text(encoding="utf-8")) == {"ok": True}
+    assert len(attempts) == 3
+    assert len(sleeps) == 2
+
+
+def test_atomic_json_reraises_persistent_windows_access_denied(monkeypatch, tmp_path):
+    target = tmp_path / "storyboard-checkpoint.json"
+    attempts = []
+    sleeps = []
+
+    def locked_replace(source, destination):
+        attempts.append(1)
+        raise PermissionError(13, "Access is denied", str(source), 5, str(destination))
+
+    monkeypatch.setattr(coordinator.os, "name", "nt")
+    monkeypatch.setattr(coordinator.os, "replace", locked_replace)
+    monkeypatch.setattr(coordinator.time, "sleep", sleeps.append)
+
+    with pytest.raises(PermissionError):
+        coordinator.atomic_json(target, {"ok": False})
+    assert len(attempts) == coordinator._REPLACE_RETRY_ATTEMPTS + 1
+    assert len(sleeps) == coordinator._REPLACE_RETRY_ATTEMPTS
+    assert not list(tmp_path.glob(".*.tmp"))

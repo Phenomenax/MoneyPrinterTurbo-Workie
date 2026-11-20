@@ -159,7 +159,8 @@ class Checkpoint:
         self.owner.close()
 
     def save(self):
-        atomic_json(self.path, self.data)
+        with self.guard:
+            atomic_json(self.path, self.data)
 
     def valid(self, record, *, artifact_roots=()):
         roots = (self.root, *(Path(root).resolve() for root in artifact_roots))
@@ -197,13 +198,14 @@ class Checkpoint:
         self.save()
         return result
 
-    def clip(self, index, **changes):
+    def clip(self, index, *, persist=True, **changes):
         with self.guard:
             key = str(index)
             entry = self.data["clips"].setdefault(key, {})
             if changes:
                 entry.update(changes)
-                self.save()
+                if persist:
+                    self.save()
             return dict(entry)
 
 

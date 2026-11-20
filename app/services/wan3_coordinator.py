@@ -20,6 +20,9 @@ from app import paths
 CAPACITY = 5
 SUBMIT_INTERVAL = 0.25
 TERMINAL_STATES = frozenset({"SUCCEEDED", "FAILED", "CANCELED", "CANCELLED"})
+_REPLACE_RETRY_ATTEMPTS = 8
+_REPLACE_RETRY_STEP = 0.02
+_WINDOWS_TRANSIENT_REPLACE_ERRORS = frozenset({5, 32, 33})
 
 
 class CoordinationError(RuntimeError):
@@ -49,10 +52,29 @@ def atomic_json(target: Path, data) -> None:
             json.dump(data, handle)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, target)
+        for attempt in range(_REPLACE_RETRY_ATTEMPTS + 1):
+            try:
+                os.replace(temporary, target)
+                temporary = None
+                break
+            except OSError as exc:
+                if (
+                    os.name != "nt"
+                    or attempt >= _REPLACE_RETRY_ATTEMPTS
+                    or not (
+                        isinstance(exc, PermissionError)
+                        or getattr(exc, "winerror", None)
+                        in _WINDOWS_TRANSIENT_REPLACE_ERRORS
+                    )
+                ):
+                    raise
+                time.sleep(_REPLACE_RETRY_STEP * (attempt + 1))
     finally:
         if temporary is not None:
-            temporary.unlink(missing_ok=True)
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 class FileLock:

@@ -213,3 +213,24 @@ def test_stage_artifacts_remain_confined_to_task_directory(tmp_path):
     with cp.scope(tmp_path / "tasks/local", "same", enabled=True):
         with pytest.raises(cp.CheckpointError, match="outside the task directory"):
             cp.run("render", lambda: str(cached))
+
+
+def test_prepare_batches_initial_pending_clips_into_single_save(tmp_path, monkeypatch):
+    from app.services import checkpoint_materials
+
+    saves = []
+    real_atomic_json = cp.atomic_json
+
+    def counted_atomic_json(target, data):
+        saves.append(len(data["clips"]))
+        real_atomic_json(target, data)
+
+    monkeypatch.setattr(cp, "atomic_json", counted_atomic_json)
+    config = SimpleNamespace(source="wan3", summary=lambda: {"source": "wan3"})
+    requests = [(f"prompt-{idx}", 2, Plan(idx)) for idx in range(1, 7)]
+    with cp.scope(tmp_path / "tasks/local", "same", enabled=True):
+        assert checkpoint_materials.prepare(requests, config, str(tmp_path)) == {}
+        saved = cp.CURRENT.get().data["clips"]
+        assert sorted(saved) == ["1", "2", "3", "4", "5", "6"]
+        assert all(item["status"] == "pending" for item in saved.values())
+    assert saves == [0, 6]

@@ -37,6 +37,7 @@ def prepare(requests, run_config, material_directory):
     provider = wan3 if run_config.source == "wan3" else volcengine_seedance
     artifact_roots = (material_directory or utils.storage_dir("cache_videos"),)
     cached = {}
+    dirty = False
     for index, (prompt, seconds, plan) in enumerate(requests):
         if plan is None:
             raise checkpoints.CheckpointError(
@@ -103,7 +104,10 @@ def prepare(requests, run_config, material_directory):
             completed(plan, items)
             cached[index] = items
         elif not record:
-            checkpoint.clip(plan.index, identity=identity, status="pending")
+            checkpoint.clip(plan.index, persist=False, identity=identity, status="pending")
+            dirty = True
+    if dirty:
+        checkpoint.save()
     return cached
 
 
