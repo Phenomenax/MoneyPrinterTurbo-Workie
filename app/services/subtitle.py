@@ -1,5 +1,8 @@
+import importlib.util
 import json
+import os
 import os.path
+from pathlib import Path
 import tempfile
 import threading
 from timeit import default_timer as timer
@@ -16,36 +19,232 @@ from app.utils import utils
 from app.utils.subtitle_reader import file_to_subtitles as file_to_subtitles
 from app.utils.subtitle_writer import write_subtitle_file
 
-model_size = config.whisper.get("model_size", "large-v3")
-device = config.whisper.get("device", "cpu")
-compute_type = config.whisper.get("compute_type", "int8")
+model_size = config.whisper.get("model_size", "large-v3-turbo")
+device = config.whisper.get("device", "auto")
+compute_type = config.whisper.get("compute_type", "auto")
 initial_prompt = config.whisper.get("initial_prompt", "") or None
 model = None
+_loaded_device = None
 _model_init_lock = threading.Lock()
+_CUDA_ERROR_MARKERS = ("cuda", "cublas", "cudnn", "cudart", "nvrtc")
+_CUDA_DLL_DIR_HANDLES = []
+_CUDA_DLL_DIRS_REGISTERED: set[str] = set()
+_CUDA_WINDOWS_REQUIRED_DLLS = (
+    "cublas64_12.dll",
+    "cublasLt64_12.dll",
+    "cudnn_ops64_9.dll",
+    "cudnn_cnn64_9.dll",
+)
+_CUDA_LINUX_PRELOAD_LIBS = (
+    "libcublasLt.so.12",
+    "libcublas.so.12",
+    "libcudnn.so.9",
+    "libcudnn_ops.so.9",
+    "libcudnn_cnn.so.9",
+)
 
 
-def _ensure_model_loaded() -> bool:
+def _register_cuda_dll_directories() -> list[str]:
+    """Expose wheel-bundled NVIDIA CUDA 12 / cuDNN 9 libraries to the process loader."""
+    added: list[str] = []
+    sub_dirs = ("bin", "lib") if os.name == "nt" else ("lib",)
+    candidate_dirs: list[Path] = []
+    for package_name in ("nvidia.cublas", "nvidia.cudnn", "nvidia.cuda_nvrtc"):
+        try:
+            spec = importlib.util.find_spec(package_name)
+        except (ImportError, ValueError, OSError):
+            spec = None
+        if spec is None or not spec.submodule_search_locations:
+            continue
+        for root_location in spec.submodule_search_locations:
+            base_path = Path(root_location)
+            for sub_dir in sub_dirs:
+                candidate = base_path / sub_dir
+                if candidate.is_dir():
+                    candidate_dirs.append(candidate)
+
+    if os.name == "nt":
+        current_path = os.environ.get("PATH", "")
+        path_entries = [entry for entry in current_path.split(os.pathsep) if entry]
+        normalized_existing = {os.path.normcase(entry) for entry in path_entries}
+        prepend_entries: list[str] = []
+        for directory in candidate_dirs:
+            resolved = str(directory.resolve())
+            key = os.path.normcase(resolved)
+            if key in _CUDA_DLL_DIRS_REGISTERED:
+                continue
+            if hasattr(os, "add_dll_directory"):
+                try:
+                    _CUDA_DLL_DIR_HANDLES.append(os.add_dll_directory(resolved))
+                except OSError:
+                    pass
+            if key not in normalized_existing:
+                prepend_entries.append(resolved)
+                normalized_existing.add(key)
+            _CUDA_DLL_DIRS_REGISTERED.add(key)
+            added.append(resolved)
+        if prepend_entries:
+            os.environ["PATH"] = os.pathsep.join(prepend_entries + path_entries)
+    else:
+        import ctypes
+
+        rtld_global = getattr(ctypes, "RTLD_GLOBAL", 0)
+        for directory in candidate_dirs:
+            resolved = str(directory.resolve())
+            if resolved in _CUDA_DLL_DIRS_REGISTERED:
+                continue
+            for lib_name in _CUDA_LINUX_PRELOAD_LIBS:
+                lib_path = directory / lib_name
+                if lib_path.is_file():
+                    try:
+                        ctypes.CDLL(str(lib_path), mode=rtld_global)
+                    except OSError:
+                        pass
+            _CUDA_DLL_DIRS_REGISTERED.add(resolved)
+            added.append(resolved)
+    return added
+
+
+def _is_auto(value: str | None) -> bool:
+    return not value or str(value).strip().lower() == "auto"
+
+
+def _is_cuda_runtime_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(marker in message for marker in _CUDA_ERROR_MARKERS)
+
+
+def _has_cuda() -> bool:
+    _register_cuda_dll_directories()
+    try:
+        import ctranslate2
+
+        if ctranslate2.get_cuda_device_count() <= 0:
+            logger.debug("whisper CUDA unavailable: no CUDA device detected")
+            return False
+    except Exception as exc:
+        logger.debug(f"whisper CUDA unavailable: ctranslate2 probe failed ({exc})")
+        return False
+    if os.name == "nt":
+        import ctypes
+
+        for dll_name in _CUDA_WINDOWS_REQUIRED_DLLS:
+            try:
+                ctypes.WinDLL(dll_name)
+            except OSError as exc:
+                logger.debug(f"whisper CUDA unavailable: failed to load {dll_name} ({exc})")
+                return False
+    return True
+
+
+def resolve_whisper_runtime(
+    configured_device: str | None = None,
+    configured_compute_type: str | None = None,
+) -> tuple[str, str]:
+    raw_device = device if configured_device is None else configured_device
+    raw_compute = compute_type if configured_compute_type is None else configured_compute_type
+    if _is_auto(raw_device):
+        resolved_device = "cuda" if _has_cuda() else "cpu"
+    else:
+        resolved_device = str(raw_device).strip().lower()
+    if _is_auto(raw_compute):
+        resolved_compute = "float16" if resolved_device == "cuda" else "int8"
+    else:
+        resolved_compute = str(raw_compute).strip().lower()
+        if (
+            _is_auto(raw_device)
+            and resolved_device == "cpu"
+            and resolved_compute in {"float16", "int8_float16"}
+        ):
+            logger.warning(
+                f"whisper compute_type '{resolved_compute}' is unsupported on CPU; "
+                "falling back to 'int8'"
+            )
+            resolved_compute = "int8"
+    return resolved_device, resolved_compute
+
+
+def find_local_model_path(
+    target_size: str | None = None, *, check_hf_cache: bool = True
+) -> str | None:
+    size = str(model_size if target_size is None else target_size).strip()
+    if not size:
+        return None
+    candidates = [Path(utils.root_dir()) / "models" / f"whisper-{size}"]
+    direct = Path(size).expanduser()
+    if direct.is_dir():
+        candidates.append(direct)
+    for candidate in candidates:
+        if candidate.is_dir() and (candidate / "model.bin").is_file():
+            return str(candidate)
+    if check_hf_cache and WhisperModel is not None:
+        try:
+            from faster_whisper.utils import download_model
+
+            cached = download_model(size, local_files_only=True)
+            if cached and (Path(cached) / "model.bin").is_file():
+                return str(cached)
+        except Exception:
+            pass
+    return None
+
+
+def _ensure_model_loaded(*, local_files_only: bool = False, force_cpu: bool = False) -> bool:
     """Load the large Whisper model once, even when jobs start concurrently."""
-    global model
-    if model is not None:
+    global model, _loaded_device
+    if model is not None and (not force_cpu or _loaded_device == "cpu"):
         return True
 
     with _model_init_lock:
-        if model is not None:
+        if model is not None and (not force_cpu or _loaded_device == "cpu"):
             return True
-        model_path = f"{utils.root_dir()}/models/whisper-{model_size}"
-        model_bin_file = f"{model_path}/model.bin"
-        if not os.path.isdir(model_path) or not os.path.isfile(model_bin_file):
-            model_path = model_size
+        if WhisperModel is None:
+            return False
+        local_path = find_local_model_path(model_size, check_hf_cache=local_files_only)
+        if local_files_only and not local_path:
+            logger.error(
+                f"local whisper model '{model_size}' not found in "
+                f"{Path(utils.root_dir()) / 'models' / f'whisper-{model_size}'}"
+            )
+            return False
+        model_path = local_path or model_size
+        if force_cpu:
+            resolved_device, resolved_compute = "cpu", "int8"
+        else:
+            resolved_device, resolved_compute = resolve_whisper_runtime()
+        if resolved_device == "cuda":
+            _register_cuda_dll_directories()
 
         logger.info(
-            f"loading model: {model_path}, device: {device}, compute_type: {compute_type}"
+            f"loading model: {model_path}, device: {resolved_device}, compute_type: {resolved_compute}"
         )
         try:
             model = WhisperModel(
-                model_size_or_path=model_path, device=device, compute_type=compute_type
+                model_size_or_path=model_path,
+                device=resolved_device,
+                compute_type=resolved_compute,
             )
+            _loaded_device = resolved_device
         except Exception as e:
+            if (
+                not force_cpu
+                and resolved_device == "cuda"
+                and _is_auto(device)
+                and _is_cuda_runtime_error(e)
+            ):
+                logger.warning(
+                    f"CUDA whisper initialization failed ({e}); falling back to cpu/int8"
+                )
+                try:
+                    model = WhisperModel(
+                        model_size_or_path=model_path,
+                        device="cpu",
+                        compute_type="int8",
+                    )
+                    _loaded_device = "cpu"
+                    return True
+                except Exception as fallback_exc:
+                    e = fallback_exc
             logger.error(
                 f"failed to load model: {e} \n\n"
                 f"********************************************\n"
@@ -58,11 +257,56 @@ def _ensure_model_loaded() -> bool:
     return True
 
 
+def transcribe_audio(
+    audio_file: str,
+    *,
+    initial_prompt: str | None = None,
+    beam_size: int = 5,
+    word_timestamps: bool = True,
+    vad_filter: bool = True,
+    vad_parameters: dict | None = None,
+    local_files_only: bool = False,
+):
+    if WhisperModel is None:
+        raise RuntimeError("faster_whisper is not installed")
+    if not _ensure_model_loaded(local_files_only=local_files_only):
+        raise RuntimeError(f"failed to load local whisper model '{model_size}'")
+    effective_prompt = (
+        globals()["initial_prompt"] if initial_prompt is None else (initial_prompt or None)
+    )
+    kwargs = {
+        "beam_size": beam_size,
+        "word_timestamps": word_timestamps,
+        "vad_filter": vad_filter,
+        "vad_parameters": vad_parameters or dict(min_silence_duration_ms=500),
+    }
+    if effective_prompt:
+        kwargs["initial_prompt"] = effective_prompt
+    try:
+        active_model = model
+        segments, info = active_model.transcribe(audio_file, **kwargs)
+        return list(segments), info
+    except Exception as exc:
+        if _loaded_device == "cuda" and _is_auto(device) and _is_cuda_runtime_error(exc):
+            logger.warning(
+                f"CUDA whisper transcription failed ({exc}); retrying on cpu/int8"
+            )
+            if not _ensure_model_loaded(local_files_only=local_files_only, force_cpu=True):
+                raise RuntimeError(
+                    f"failed to reload whisper model '{model_size}' on cpu"
+                ) from exc
+            active_model = model
+            segments, info = active_model.transcribe(audio_file, **kwargs)
+            return list(segments), info
+        raise
+
+
 def create(
     audio_file,
     subtitle_file: str = "",
     word_level: bool = False,
     log_details: bool = True,
+    initial_prompt: str | None = None,
 ):
     if WhisperModel is None:
         logger.warning("faster_whisper not available, skipping whisper subtitle generation")
@@ -75,13 +319,13 @@ def create(
     if not subtitle_file:
         subtitle_file = f"{audio_file}.srt"
 
-    segments, info = model.transcribe(
+    segments, info = transcribe_audio(
         audio_file,
+        initial_prompt=initial_prompt,
         beam_size=5,
         word_timestamps=True,
         vad_filter=True,
         vad_parameters=dict(min_silence_duration_ms=500),
-        **({"initial_prompt": initial_prompt} if initial_prompt else {}),
     )
 
     logger.info(

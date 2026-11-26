@@ -681,11 +681,13 @@ upload_post_max_pending_tasks = 10
 [whisper]
 # The model is downloaded automatically on first use unless a matching local
 # directory exists at ./models/whisper-{model_size}.
-model_size = "large-v3"
-# device: "cpu" or "cuda". Common compute types include "int8" for CPU and
-# "float16" or "int8_float16" for CUDA.
-device = "cpu"
-compute_type = "int8"
+model_size = "large-v3-turbo"
+# device: "auto", "cpu", or "cuda". "auto" selects "cuda" when a usable CUDA
+# runtime is available and falls back to "cpu".
+device = "auto"
+# compute_type: "auto", "int8", "float16", "int8_float16", etc.
+# "auto" selects "float16" on CUDA and "int8" on CPU.
+compute_type = "auto"
 # Optional prompt that biases Whisper's decoder toward specific vocabulary
 # (brand names, technical terms). Passed as initial_prompt to transcribe().
 # Leave empty to disable.

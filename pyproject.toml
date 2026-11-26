@@ -25,6 +25,8 @@ dependencies = [
     "faster-whisper==1.1.0",
     # 与 requirements.txt 保持一致：PyAV 19 移除了 Whisper 使用的参数。
     "av<19",
+    "nvidia-cublas-cu12>=12.4,<13; (sys_platform == 'win32' and platform_machine == 'AMD64') or (sys_platform == 'linux' and platform_machine == 'x86_64')",
+    "nvidia-cudnn-cu12>=9,<10; (sys_platform == 'win32' and platform_machine == 'AMD64') or (sys_platform == 'linux' and platform_machine == 'x86_64')",
     "toml==0.10.2",
     "imageio-ffmpeg==0.6.0",
     "loguru==0.7.3",
@@ -126,3 +128,7 @@ package = true
 # MoviePy 2.2.1 caps Pillow below 12; patched Pillow is required for image decoding.
 # Keep this in sync with requirements-security.txt for container/legacy installs.
 override-dependencies = ["pillow>=13.0.0,<14"]
+required-environments = [
+    "sys_platform == 'win32' and platform_machine == 'AMD64'",
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
