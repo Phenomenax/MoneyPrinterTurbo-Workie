@@ -13,7 +13,7 @@ from pathlib import Path
 from app.services.wan3_coordinator import FileLock, atomic_json
 
 CURRENT = contextvars.ContextVar("storyboard_checkpoint", default=None)
-STAGES = ("audio", "subtitles", "materials", "render")
+STAGES = ("audio", "subtitles", "materials", "combine", "native_subtitles", "render")
 
 
 class CheckpointError(RuntimeError):

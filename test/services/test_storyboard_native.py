@@ -84,12 +84,16 @@ def test_native_fields_only_reach_their_own_shot_and_legacy_shape_is_unchanged(b
     assert "Wide: Red visual" in plans[0].prompt
     assert "Alpha line." in plans[0].prompt and "Beta line." not in plans[0].prompt
     assert "Warm piano at 80 BPM" in plans[0].prompt and "Fast drums" not in plans[0].prompt
-    assert board.narration_voice in plans[0].prompt and board.captions_guidance in plans[0].prompt
+    assert board.narration_voice in plans[0].prompt
+    assert board.captions_guidance not in plans[0].prompt
+    assert all("Generate captions" not in plan.prompt for plan in plans)
+    assert all("Do not render or burn in any subtitles" in plan.prompt for plan in plans)
     assert "0.2 seconds" in plans[0].prompt
     assert "No dialogue, narration" in plans[2].prompt
     assert "No background music and no additional sound effects" in plans[2].prompt
     assert "Alpha line." not in plans[2].prompt and "Generate captions" not in plans[2].prompt
     assert board.shots[0].narration == "Alpha line."
+    assert [plan.narration for plan in plans] == ["Alpha line.", "Beta line.", ""]
 
 
 def test_full_music_design_and_unchanged_voice_reach_every_segment(board_path):
@@ -131,15 +135,25 @@ def test_old_native_storyboards_without_music_design_remain_readable(board_path,
     assert "Current music segment: 1 of 3." in plans[0].prompt
 
 
-@pytest.mark.parametrize("section", ["Narration voice", "Captions guidance"])
-def test_missing_and_empty_guidance_fail_before_generation(board_path, section):
-    import re
-
+def test_missing_and_empty_narration_voice_fail_before_generation(board_path):
     text = BOARD
-    for replacement in ("", f"## {section}\n\n—\n\n"):
-        board_path.write_text(re.sub(r"## " + section + r"\n.*?(?=## |\Z)", replacement, text, flags=re.S))
-        with pytest.raises(ValueError, match=section):
+    for replacement in ("", "## Narration voice\n\n—\n\n"):
+        board_path.write_text(re.sub(r"## Narration voice\n.*?(?=## |\Z)", replacement, text, flags=re.S))
+        with pytest.raises(ValueError, match="Narration voice"):
             parse_native_storyboard(board_path)
+
+
+@pytest.mark.parametrize("replacement", ["", "## Captions guidance\n\n—\n\n"])
+def test_missing_or_empty_captions_guidance_is_allowed_in_native_mode(board_path, replacement):
+    board_path.write_text(
+        re.sub(r"## Captions guidance\n.*?(?=## |\Z)", replacement, BOARD, flags=re.S),
+        encoding="utf-8",
+    )
+    board = parse_native_storyboard(board_path)
+    assert board.captions_guidance == ""
+    plans = native.build_generation_plan(board, run_config())
+    assert len(plans) == 3
+    assert all("Do not render or burn in any subtitles" in plan.prompt for plan in plans)
 
 
 def test_legacy_clean_narration_is_ignored_but_tts_still_checks_it(board_path):
@@ -208,10 +222,13 @@ def test_integer_requests_are_never_clamped(board_path, duration, minimum, maxim
 @pytest.mark.parametrize("options", [
     ["--voice-name", "no-voice"], ["--voice-volume", "0"], ["--voice-rate", "1"],
     ["--custom-audio-file", "missing.wav"], ["--bgm-type", "none"], ["--bgm-file", "missing.mp3"],
-    ["--bgm-volume", "0"], ["--font-name", "missing.ttf"], ["--no-subtitle-enabled"],
-    ["--subtitle-position", "top"], ["--stroke-color", "#FFFFFF"], ["--font-size", "40"],
+    ["--bgm-volume", "0"],
     ["--video-clip-duration", "5"], ["--video-clip-speed", "1.1"], ["--video-transition-mode", "fade-in"],
-    ["--video-music-prompt", "piano"], ["--subtitle-background-enabled"], ["--video-count", "2"],
+    ["--video-music-prompt", "piano"], ["--sonilo-bgm-prompt", "jazz"], ["--video-count", "2"],
+    ["--rounded-subtitle-background"],
+    ["--subtitle-animation", "pop_spring"],
+    ["--custom-position", "75"],
+    ["--no-subtitle-background-enabled", "--subtitle-background-color", "#112233"],
 ])
 def test_explicit_replacement_options_fail_at_cli_parse(board_path, options):
     with pytest.raises(SystemExit) as caught:
@@ -219,15 +236,60 @@ def test_explicit_replacement_options_fail_at_cli_parse(board_path, options):
     assert caught.value.code == 2
 
 
+def test_native_allows_subtitle_and_font_options(board_path):
+    args = cli.parse_args(
+        native_argv(
+            board_path,
+            "--subtitle-enabled",
+            "--subtitle-position", "custom",
+            "--custom-position", "80",
+            "--font-name", "MicrosoftYaHeiBold.ttc",
+            "--font-size", "48",
+            "--text-fore-color", "#FFEE00",
+            "--stroke-color", "#111111",
+            "--stroke-width", "2.5",
+            "--subtitle-background-enabled",
+            "--subtitle-background-color", "#222222",
+            "--subtitle-display-mode", "word_by_word",
+        )
+    )
+    params = cli.build_video_params(args)
+    cli.prepare_cli_files(params, "video")
+    assert params.subtitle_enabled is True
+    assert params.subtitle_position == "custom"
+    assert params.custom_position == 80
+    assert params.font_name == "MicrosoftYaHeiBold.ttc"
+    assert params.font_size == 48
+    assert params.text_fore_color == "#FFEE00"
+    assert params.stroke_color == "#111111"
+    assert params.stroke_width == 2.5
+    assert params.text_background_color == "#222222"
+    assert params.rounded_subtitle_background is False
+    assert params.subtitle_animation == "none"
+    assert params.subtitle_display_mode == "word_by_word"
+
+    bad_args = cli.parse_args(native_argv(board_path, "--font-name", "missing.ttf"))
+    bad_params = cli.build_video_params(bad_args)
+    with pytest.raises(ValueError, match="subtitle font"):
+        cli.prepare_cli_files(bad_params, "video")
+
+
 def test_cli_defaults_stay_tts_and_saved_audio_resources_do_not_apply(board_path, monkeypatch):
     assert cli.parse_args(["--video-subject", "old task"]).storyboard_audio_mode == "tts"
     monkeypatch.setattr(config, "ui", {"voice_name": "invalid", "font_name": "missing.ttf", "video_clip_speed": 1.5,
-                                     "voice_rate": 2, "subtitle_enabled": True, "bgm_type": "custom"})
+                                     "voice_rate": 2, "subtitle_enabled": False, "bgm_type": "custom"})
     args = cli.parse_args(native_argv(board_path, "--video-clip-speed", "1"))
     params = cli.build_video_params(args)
     cli.prepare_cli_files(params, "video")
-    assert (params.voice_name, params.bgm_type, params.font_name, params.video_clip_speed) == ("no-voice", "", "", 1)
-    assert not params.subtitle_enabled and not params.custom_audio_file
+    assert (params.voice_name, params.bgm_type, params.font_name, params.video_clip_speed) == (
+        "no-voice", "", "STHeitiMedium.ttc", 1
+    )
+    assert params.subtitle_enabled is True and not params.custom_audio_file
+
+    disabled_args = cli.parse_args(native_argv(board_path, "--no-subtitle-enabled"))
+    disabled_params = cli.build_video_params(disabled_args)
+    cli.prepare_cli_files(disabled_params, "video")
+    assert disabled_params.subtitle_enabled is False and disabled_params.font_name == ""
 
 
 @pytest.mark.parametrize("source, prefix, model, expected", [
@@ -356,7 +418,7 @@ def test_api_rejection_stops_dispatch_and_keeps_previous_download_and_remote_ids
         return [(str(downloaded), 0.5, {}, remote_id)]
 
     monkeypatch.setattr(material, "_generate_wan3_materials", generate)
-    result = cp.start(task_id="rejected-native", params=VideoParams(video_subject="native", video_source="wan3"),
+    result = cp.start(task_id="rejected-native", params=VideoParams(video_subject="native", video_source="wan3", subtitle_enabled=False),
                       storyboard_data=board, video_run_config=run_config(), storyboard_audio_mode="native")
     assert result["failed_stage"] == "materials"
     assert result["wan3_task_id"] == "paid-2"
@@ -577,7 +639,7 @@ def test_real_local_render_failure_resumes_without_submitting_again(tmp_path, bo
     monkeypatch.setattr(material, "_generate_wan3_materials", generate)
     executor = video._run_concat_with_heartbeat
     monkeypatch.setattr(video, "_run_concat_with_heartbeat", Mock(side_effect=OSError("local encoder unavailable")))
-    options = dict(task_id="render-resume", params=VideoParams(video_subject="native", video_source="wan3", video_aspect="16:9"),
+    options = dict(task_id="render-resume", params=VideoParams(video_subject="native", video_source="wan3", video_aspect="16:9", subtitle_enabled=False),
                    storyboard_data=board, video_run_config=run_config(), storyboard_audio_mode="native")
     failed = cp.start(**options)
     assert failed["failed_stage"] == "combine" and len(paid) == 3
@@ -591,7 +653,7 @@ def test_real_local_render_failure_resumes_without_submitting_again(tmp_path, bo
 def test_native_resume_reuses_materials_and_render_without_tts_or_rebilling(tmp_path, board_path, monkeypatch, failure):
     board = parse_native_storyboard(board_path)
     params = VideoParams(video_subject="native", video_source="wan3", video_aspect="16:9",
-                         video_script=board.video_script, match_materials_to_script=True)
+                         video_script=board.video_script, match_materials_to_script=True, subtitle_enabled=False)
     monkeypatch.setattr(utils, "check_ffmpeg_ready", lambda: True)
     forbidden = Mock(side_effect=AssertionError("native path called legacy audio/LLM/subtitle/BGM"))
     for module, name in [(task, "generate_audio"), (task, "generate_script"), (task, "generate_terms"),
@@ -711,3 +773,16 @@ def test_visual_continuity_changes_revision_request_hash(board_path):
     board_path.write_text(BOARD + "\n## Visual continuity\nSame blue coat.\n", encoding="utf-8")
     second = native.build_generation_plan(parse_native_storyboard(board_path), config)[0]
     assert revision.request_hash(first, config, "16:9") != revision.request_hash(second, config, "16:9")
+
+
+def test_captions_guidance_change_does_not_change_revision_request_hash(board_path):
+    from app.services import storyboard_revision as revision
+
+    config = native.audio_run_config(run_config())
+    first = native.build_generation_plan(parse_native_storyboard(board_path), config)[0]
+    board_path.write_text(
+        re.sub(r"## Captions guidance\n.*?(?=## |\Z)", "", BOARD, flags=re.S),
+        encoding="utf-8",
+    )
+    second = native.build_generation_plan(parse_native_storyboard(board_path), config)[0]
+    assert revision.request_hash(first, config, "16:9") == revision.request_hash(second, config, "16:9")

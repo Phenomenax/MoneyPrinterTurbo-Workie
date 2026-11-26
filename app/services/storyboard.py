@@ -447,11 +447,18 @@ def parse_native_storyboard(path: str | Path) -> NativeStoryboard:
     if resolutions and (len(resolutions) != 1 or resolution not in {"480p", "720p", "1080p"}):
         raise ValueError("storyboard Resolution must be a single 480p, 720p or 1080p value")
 
+    try:
+        captions_guidance = _section(text, "Captions guidance")
+    except ValueError:
+        captions_guidance = ""
+    if _is_silence_marker(captions_guidance):
+        captions_guidance = ""
+
     return NativeStoryboard(
-        resolution=resolution,        video_script=board.video_script, video_terms=board.video_terms,
+        resolution=resolution, video_script=board.video_script, video_terms=board.video_terms,
         aspect=board.aspect, title=board.title, shots=board.shots,
         narration_voice=guidance("Narration voice"),
-        captions_guidance=guidance("Captions guidance"),
+        captions_guidance=captions_guidance,
         music_mood=music_mood,
         visual_continuity=visual_continuity,
     )

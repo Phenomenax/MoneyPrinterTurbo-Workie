@@ -35,23 +35,23 @@ class NativeShotPlan:
     remote_task_id: str | None = None
     material_seconds: float = 0
     material_path: str = ""
+    narration: str = ""
 
 
 def validate_native_arguments(arguments):
-    """Reject explicit replacement audio/subtitles before any paid submission."""
+    """Reject explicit replacement audio/BGM/timing conflicts before any paid submission."""
     supplied = {item.split("=", 1)[0] for item in arguments if item.startswith("--")}
     conflicts = supplied & {
         "--custom-audio-file", "--video-music-prompt", "--sonilo-bgm-prompt",
-        "--text-fore-color", "--custom-position", "--rounded-subtitle-background",
-        "--no-rounded-subtitle-background", "--video-clip-duration",
+        "--video-clip-duration", "--rounded-subtitle-background",
     }
     conflicts.update(key for key in supplied if key.startswith((
-        "--voice-", "--bgm-", "--subtitle-", "--no-subtitle-", "--font-", "--stroke-",
+        "--voice-", "--bgm-",
     )))
     if conflicts:
         raise NativeStoryboardError(
             "native storyboard audio conflicts with " + ", ".join(sorted(conflicts))
-            + "; describe speech, music and captions in the storyboard instead"
+            + "; describe speech and music in the storyboard instead"
         )
 
     def value(option):
@@ -70,6 +70,19 @@ def validate_native_arguments(arguments):
         raise NativeStoryboardError("native storyboard audio requires no overlapping transitions")
     if value("--video-count") not in {None, "1"}:
         raise NativeStoryboardError("native storyboard audio produces one video per storyboard")
+    animation = value("--subtitle-animation")
+    if animation is not None and animation != "none":
+        raise NativeStoryboardError("native storyboard subtitles do not support entrance animations")
+    if "--custom-position" in supplied and value("--subtitle-position") != "custom":
+        raise NativeStoryboardError("--custom-position requires --subtitle-position custom")
+    if (
+        "--no-subtitle-background-enabled" in supplied
+        and "--subtitle-background-color" in supplied
+    ):
+        raise NativeStoryboardError(
+            "--subtitle-background-color cannot be combined with "
+            "--no-subtitle-background-enabled"
+        )
 
 
 def audio_run_config(run_config):
@@ -101,8 +114,8 @@ def build_generation_plan(storyboard, run_config):
                 f"request {seconds}s is outside model range {run_config.min_duration}–"
                 f"{run_config.max_duration}s; revise and approve the storyboard", shot=shot.index,
             )
-        if shot.narration and (not storyboard.narration_voice.strip() or not storyboard.captions_guidance.strip()):
-            raise NativeStoryboardError("spoken shots require Narration voice and Captions guidance", shot=shot.index)
+        if shot.narration and not storyboard.narration_voice.strip():
+            raise NativeStoryboardError("spoken shots require Narration voice", shot=shot.index)
         lines = [
             "Generate this single self-contained shot with synchronized video and native audio.",
         ]
@@ -118,7 +131,7 @@ def build_generation_plan(storyboard, run_config):
             "Shot type and visual description:\n" + shot.prompt,
             f"Requested duration: {seconds} seconds. Keep the first and last 0.2 seconds free "
             "of narration or dialogue; finish the spoken line between these margins. "
-            "Do not cut spoken words or captions at either boundary.",
+            "Do not cut spoken words at either boundary.",
             "Whole-video narration voice (description only, do not read aloud):\n"
             + (storyboard.narration_voice or "No narration."),
             "Apply this exact narrator profile to every spoken shot: keep the same perceived "
@@ -129,7 +142,7 @@ def build_generation_plan(storyboard, run_config):
             lines.append("Speak exactly the following line, without additions or omissions. "
                          "Do not speak instructions or headings:\n" + shot.narration)
         else:
-            lines.append("No dialogue, narration, extra voices or narration captions in this shot.")
+            lines.append("No dialogue, narration or extra voices in this shot.")
         if storyboard.music_mood:
             lines.append("Whole-video music design (context only, do not read aloud):\n"
                          + storyboard.music_mood)
@@ -144,10 +157,19 @@ def build_generation_plan(storyboard, run_config):
         )
         lines.append("Music / sound effects for this shot (do not read aloud):\n"
                      + (shot.music_sfx or "No background music and no additional sound effects."))
-        if shot.narration:
-            lines.append("Generate captions for only the exact spoken line above, following this guidance:\n"
-                         + storyboard.captions_guidance)
-        plans.append(NativeShotPlan(shot.index, "\n\n".join(lines), milliseconds / 1000, seconds))
+        lines.append(
+            "Do not render or burn in any subtitles, captions, on-screen text, titles or "
+            "watermarks anywhere in the video frame; keep the visuals completely free of text overlays."
+        )
+        plans.append(
+            NativeShotPlan(
+                shot.index,
+                "\n\n".join(lines),
+                milliseconds / 1000,
+                seconds,
+                narration=shot.narration,
+            )
+        )
     return plans
 
 
@@ -288,6 +310,13 @@ def run(task_id, params, storyboard, run_config, *, stop_at="video", explicit_cl
         plans = build_generation_plan(storyboard, audio_config)
         if not utils.check_ffmpeg_ready():
             raise NativeStoryboardError("FFmpeg is unavailable")
+        needs_subtitles = False
+        if getattr(params, "subtitle_enabled", True):
+            from app.services import storyboard_native_subtitles
+
+            needs_subtitles = storyboard_native_subtitles.has_spoken_shots(plans)
+            if needs_subtitles:
+                storyboard_native_subtitles.ensure_native_whisper_ready(params, plans)
     except (ValueError, OSError) as exc:
         return task._mark_task_failed(task_id, "preflight", str(exc))
 
@@ -315,25 +344,102 @@ def run(task_id, params, storyboard, run_config, *, stop_at="video", explicit_cl
         diagnostics()
         if not clips:
             return task._mark_task_failed(task_id, "materials", "no native materials")
-        generation_progress.stage("rendering")
-        state.state.update_task(task_id, stage="combine", progress=50, materials=clips)
-        rendered = storyboard_checkpoint.run("render", lambda: render_native(
-            clips, plans, str(Path(utils.task_dir(task_id)) / "final-1.mp4"),
-            aspect=params.video_aspect, threads=params.n_threads, fit_mode=params.video_fit_mode,
-        ))
+        task_root = Path(utils.task_dir(task_id))
+        final_output = str(task_root / "final-1.mp4")
+        if needs_subtitles:
+            from app.services import storyboard_native_subtitles
+
+            def stitch_clean():
+                generation_progress.stage("rendering")
+                state.state.update_task(
+                    task_id, stage="combine", progress=50, materials=clips
+                )
+                clean_output = str(task_root / "native-clean.mp4")
+                stitched = render_native(
+                    clips,
+                    plans,
+                    clean_output,
+                    aspect=params.video_aspect,
+                    threads=params.n_threads,
+                    fit_mode=params.video_fit_mode,
+                )
+                return {
+                    "clean_video": stitched["videos"][0],
+                    "actual_seconds": stitched["actual_seconds"],
+                    "frame_counts": stitched.get("frame_counts", []),
+                    "output_seconds": stitched["output_seconds"],
+                }
+
+            stitched = storyboard_checkpoint.run("combine", stitch_clean)
+
+            def prepare_subtitles():
+                generation_progress.stage("subtitles")
+                state.state.update_task(task_id, stage="subtitles", progress=70)
+                sub_info = storyboard_native_subtitles.generate_native_subtitles(
+                    stitched["clean_video"],
+                    plans,
+                    stitched.get("frame_counts", []),
+                    str(task_root / "subtitle.srt"),
+                    params=params,
+                    fps=FPS,
+                )
+                return {
+                    "subtitle_path": sub_info["subtitle_path"],
+                    "cue_count": sub_info["cue_count"],
+                }
+
+            subtitled = storyboard_checkpoint.run("native_subtitles", prepare_subtitles)
+            generation_progress.stage("rendering")
+            state.state.update_task(
+                task_id,
+                stage="render",
+                progress=85,
+                materials=clips,
+                subtitle_path=subtitled["subtitle_path"],
+            )
+
+            def finalize_render():
+                burned = storyboard_native_subtitles.burn_native_subtitles(
+                    stitched["clean_video"],
+                    subtitled["subtitle_path"],
+                    final_output,
+                    params=params,
+                    aspect=params.video_aspect,
+                    threads=params.n_threads,
+                )
+                return {
+                    "videos": burned["videos"],
+                    "combined_videos": [],
+                    "actual_seconds": stitched["actual_seconds"],
+                    "frame_counts": stitched["frame_counts"],
+                    "output_seconds": burned["output_seconds"],
+                    "subtitle_path": subtitled["subtitle_path"],
+                }
+
+            rendered = storyboard_checkpoint.run("render", finalize_render)
+        else:
+            generation_progress.stage("rendering")
+            state.state.update_task(task_id, stage="combine", progress=50, materials=clips)
+            rendered = storyboard_checkpoint.run("render", lambda: render_native(
+                clips, plans, final_output,
+                aspect=params.video_aspect, threads=params.n_threads, fit_mode=params.video_fit_mode,
+            ))
+        subtitle_path = rendered.get("subtitle_path", "")
         if rendered.get("frame_counts"):
             from app.services.storyboard_revision import publish_manifest
 
-            publish_manifest(Path(utils.task_dir(task_id)), rendered, clips, plans,
+            publish_manifest(task_root, rendered, clips, plans,
                              audio_config, params.video_aspect)
         for plan, actual in zip(plans, rendered["actual_seconds"], strict=True):
             plan.material_seconds = actual
         diagnostics()
         task_artifacts.patch_script_data(task_id, actual_total_seconds=sum(rendered["actual_seconds"]),
-                                         output_seconds=rendered["output_seconds"])
+                                         output_seconds=rendered["output_seconds"],
+                                         subtitle_enabled=bool(params.subtitle_enabled),
+                                         subtitle_path=subtitle_path)
         result = dict(state=const.TASK_STATE_COMPLETE, videos=rendered["videos"], combined_videos=[],
                       script=storyboard.video_script, terms=prompts, materials=clips,
-                      storyboard_audio_mode="native", audio_file="", subtitle_path="",
+                      storyboard_audio_mode="native", audio_file="", subtitle_path=subtitle_path,
                       audio_duration=rendered["output_seconds"])
         state.state.update_task(task_id, **result, progress=100, stage="complete")
         return result

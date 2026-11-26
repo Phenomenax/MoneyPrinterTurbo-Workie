@@ -8,11 +8,13 @@
 
 | 文件或目录 | 类型 | 原因 | 维护说明 |
 |---|---|---|---|
-| `app/models/schema.py`、`config.example.toml` | 默认素材源与配置 | 默认使用 Wan3，并提供其接入、时长及并发配置 | 保留 `video_source = "wan3"` 和 Wan3 配置字段；接纳官方新增字段及枚举默认值修复；不要覆盖用户的 `config.toml` |
-| `cli.py` | Workie 执行入口 | 接入分镜、进度、环境选源、检查点及显式原生音频分发 | 保留 `--storyboard-audio-mode tts|native`，默认仍为 `tts`。native 只支持环境选源的完整分镜单任务，使用原生解析并在收费前拒绝替代声音、本地字幕、固定片段时长和变速参数；保存的旧配音、配乐和字体设置不进入资源校验。保留原分镜、进度与检查点参数；原生分镜 Resolution 优先于供应商环境变量，仅作用于模型请求。宽高比仍为显式 CLI > 分镜 Aspect > `9:16`。环境配置不与 CLI 原生 batch 组合；恢复沿用原 task ID，重建必须明确标记；镜头修改仅凭冻结方案及其 SHA-256 启动新的原声检查点任务 |
+| `app/models/schema.py`、`config.example.toml` | 默认素材源与配置 | 默认使用 Wan3，并提供其接入、时长、并发及本地 Whisper 默认配置 | 保留 `video_source = "wan3"`、Wan3 配置字段及 `[whisper]` 默认 `large-v3-turbo`/`auto`；接纳官方新增字段及枚举默认值修复；不要覆盖用户的 `config.toml` |
+| `cli.py` | Workie 执行入口 | 接入分镜、进度、环境选源、检查点及显式原生音频分发 | 保留 `--storyboard-audio-mode tts|native`，默认仍为 `tts`。native 只支持环境选源的完整分镜单任务，使用原生解析并在收费前拒绝替代声音、BGM、固定片段时长和变速参数，同时放行显式字幕与字体参数（默认开启后期字幕并使用内置默认字体，不读取 `config.ui` 旧配置）。保留原分镜、进度与检查点参数；原生分镜 Resolution 优先于供应商环境变量，仅作用于模型请求。宽高比仍为显式 CLI > 分镜 Aspect > `9:16`。环境配置不与 CLI 原生 batch 组合；恢复沿用原 task ID，重建必须明确标记；镜头修改仅凭冻结方案及其 SHA-256 启动新的原声检查点任务 |
 | `app/services/llm.py` | Wan3 画面提示词 | 为视频生成提供完整场景描述 | 保留 `generate_video_prompts` 接口及其顺序、数量要求；与官方库存搜索关键词生成分开维护 |
 | `app/services/material.py` | Wan3 与分镜素材接入 | 接入素材适配器、共享有界调度、远端任务记录、Seedance 分镜及镜头检查点 | 保留有序返回、共享调度与环境快照。native 下载后的时长探测只读视频，先保存素材检查点，再由独立原生路径检查音轨；不得把缺音轨转成可重新收费的生成失败，也不按配音时长拒绝较短原生素材。旧 TTS 校验不变。恢复先核对全部原提交，复用成功镜头；未知且无编号的提交不得重提 |
-| `app/services/task.py` | 流水线编排 | 接入分镜计时、供应商任务 ID、阶段进度、检查点和原生模式分发 | `tts` 保留逐镜头配音及校准时间线，旧检查点身份不变。仅显式 native 分发到独立模块，跳过 TTS、识别、字幕叠加和额外配乐；使用素材、合成、完成进度及现有 render 检查点。失败保留真实错误、镜头及远端任务 ID。官方生成上下文、分镜参数与 `video_run_config` 须一起传递，不把快照密钥写入状态 |
+| `app/services/subtitle.py` | 本地 Whisper 字幕识别 | 支持 `large-v3-turbo`/`auto` 设备自适应、自动注册 `.venv` NVIDIA CUDA 12/cuDNN 9 运行库目录、本地离线模型探测与单次 `initial_prompt` 覆盖 | 保留上游 `create`/`correct`/`transcribe_audio_bytes` 行为与单例锁；`auto` 优先注册并检测可用 CUDA 12/cuDNN 9 运行库并支持异常回退 CPU `int8`，`local_files_only=True` 不触发隐式网络下载 |
+| `pyproject.toml`、`uv.lock` | CUDA 12 运行库依赖 | 在 Windows / Linux x86_64 环境下引入 `nvidia-cublas-cu12` 与 `nvidia-cudnn-cu12`（cuDNN 9），确保 `uv sync --frozen` 保留本地 Whisper GPU 加速依赖 | 保留 `faster-whisper` 对应的 CUDA 12 / cuDNN 9 平台条件依赖；同步上游依赖时重新锁版本并验证 `uv sync --frozen` |
+| `app/services/task.py` | 流水线编排 | 接入分镜计时、供应商任务 ID、阶段进度、检查点和原生模式分发 | `tts` 保留逐镜头配音及校准时间线，旧检查点身份不变。仅显式 native 分发到独立模块，跳过 TTS 和额外配乐，由原生模块执行逐镜头本地 Whisper 识别与 FFmpeg ASS 后期压制；使用素材、合成、字幕、渲染、完成进度及现有检查点。失败保留真实错误、镜头及远端任务 ID。官方生成上下文、分镜参数与 `video_run_config` 须一起传递，不把快照密钥写入状态 |
 | `app/services/video.py` | 分镜合成 | 保留旧分镜计时并提供原生音轨拼接接入 | 旧 `storyboard_shot_plan`、时长校验与直接拼接优化不变。公共 FFmpeg 拼接新增默认关闭的 `preserve_audio`；native 显式映射音视频，不能继承 stream-copy 的 `-an`，PCM 中间段拼接后只编码一次 AAC。复制失败可回退编码，超时不重试；其他调用沿用原行为 |
 | `webui/Main.py`、`webui/settings_providers.py` | Wan3 界面接入 | 提供素材源、凭据、端点、模型和时长选择 | 保留 Wan3 默认源、2～30 秒选项和生成前配置校验；同步官方设置页重构时，迁移到新的标签、表单及就绪状态入口，保留切换供应商前保存最终输入的回调 |
 | `docs/skill/mpt_agent.py` | Agent 执行协议 | 接入环境选源、分镜路径处理及机器可读反馈 | 标准调用不注入 Wan3；视频 Key、地址和模型只来自环境变量，完整分镜路径不写回 `config.toml`。保留旧配置补字段而不覆盖已有值；预检不得误索取完整分镜不需要的 LLM Key；能力检查包含配置模块 API 与 `--video-config-from-env`，不能只看版本号。保留任务 ID 匹配、当前运行结果校验、`MPT_FEEDBACK` 和脱敏；日志走 stderr；保留官方新增来源、凭据及计费确认逻辑 |

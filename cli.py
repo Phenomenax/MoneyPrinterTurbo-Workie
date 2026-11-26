@@ -1029,12 +1029,51 @@ def build_video_params(args: argparse.Namespace) -> VideoParams:
     if args.storyboard_audio_mode == "native":
         # Saved TTS, BGM, font and speed defaults cannot affect the native path
         # or trigger validation of resources that it never uses.
+        subtitle_enabled = True if args.subtitle_enabled is None else args.subtitle_enabled
+        if args.subtitle_background_enabled is False:
+            text_background_color = False
+        elif args.subtitle_background_color is not None:
+            text_background_color = args.subtitle_background_color
+        elif args.subtitle_background_enabled is True:
+            text_background_color = True
+        else:
+            text_background_color = False
         return VideoParams(
             video_subject=args.video_subject.strip(), video_script=args.video_script,
             video_terms=args.video_terms, video_source=args.video_source,
             video_count=1, video_aspect=args.video_aspect,
             voice_name="no-voice", voice_rate=1, voice_volume=1, custom_audio_file="",
-            subtitle_enabled=False, font_name="", bgm_type="", bgm_file="", bgm_volume=0,
+            subtitle_enabled=subtitle_enabled,
+            font_name=(
+                args.font_name
+                if args.font_name is not None
+                else ("STHeitiMedium.ttc" if subtitle_enabled else "")
+            ),
+            subtitle_position=(
+                args.subtitle_position
+                if args.subtitle_position is not None
+                else DEFAULT_SUBTITLE_POSITION
+            ),
+            subtitle_display_mode=(
+                args.subtitle_display_mode
+                if args.subtitle_display_mode is not None
+                else "sentence"
+            ),
+            subtitle_animation="none",
+            custom_position=(
+                args.custom_position
+                if args.custom_position is not None
+                else DEFAULT_CUSTOM_POSITION
+            ),
+            text_fore_color=(
+                args.text_fore_color if args.text_fore_color is not None else "#FFFFFF"
+            ),
+            font_size=args.font_size if args.font_size is not None else 60,
+            stroke_color=args.stroke_color if args.stroke_color is not None else "#000000",
+            stroke_width=args.stroke_width if args.stroke_width is not None else 1.5,
+            text_background_color=text_background_color,
+            rounded_subtitle_background=False,
+            bgm_type="", bgm_file="", bgm_volume=0,
             video_clip_speed=1, video_transition_mode=None, video_concat_mode="sequential",
             match_materials_to_script=True, video_fit_mode=args.video_fit_mode or "cover",
             n_threads=args.n_threads or 2,
